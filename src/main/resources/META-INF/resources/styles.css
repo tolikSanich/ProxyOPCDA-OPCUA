@@ -27,3 +27,36 @@ vaadin-side-nav:has(vaadin-side-nav-item:only-child)::after {
     min-width: 100%;
     white-space: normal;
 }
+/* Инженерный стиль для OPC DA-UA Proxy */
+
+/* Компактные таблицы и моноширинный шрифт для данных */
+vaadin-grid {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: var(--lumo-font-size-s);
+}
+
+/* Статусные индикаторы качества */
+.status-good {
+    color: var(--lumo-success-color);
+    font-weight: bold;
+}
+
+.status-bad {
+    color: var(--lumo-error-color);
+    font-weight: bold;
+}
+
+.status-uncertain {
+    color: var(--lumo-warning-color);
+    font-weight: bold;
+}
+
+vaadin-grid::part(row-error),
+vaadin-grid::part(row-error-cell) {
+    background-color: var(--lumo-error-color-10pct);
+}
+
+vaadin-grid::part(row-warning),
+vaadin-grid::part(row-warning-cell) {
+    background-color: var(--lumo-warning-color-10pct);
+}

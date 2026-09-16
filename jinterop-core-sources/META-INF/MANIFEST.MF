@@ -1,0 +1,13 @@
+Manifest-Version: 1.0
+Bundle-SymbolicName: org.openscada.jinterop.core.source
+Bundle-Version: 2.1.8
+Bundle-Name: %bundleName
+Bundle-Localization: OSGI-INF/l10n/bundle-src
+Built-By: jrose
+Bundle-ManifestVersion: 2
+Bundle-Vendor: %bundleVendor
+Eclipse-SourceBundle: org.openscada.jinterop.core;version="2.1.8";root
+ s:="."
+Created-By: Apache Maven
+Build-Jdk: 1.8.0_162
+

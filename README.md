@@ -18,7 +18,7 @@ No system Maven required — the wrapper is included. Then open **http://localho
 
 The first start takes ~30 seconds while Maven downloads dependencies. You'll get a runnable **Task List** app: a data grid (Description / Due Date / Creation Date), a Create button, and an empty-state message. When you see that, you're running.
 
-> **Port 8080 already in use?** Stop the other process, or set `server.port=8081` in `src/main/resources/application.properties` and open that port instead.
+> **Port 8080 already in use?** Stop the other process, or set `server.port=8081` in `src/main/resources/application.properties1` and open that port instead.
 >
 > **To stop the app:** press `Ctrl+C` in the terminal (or the red Stop button if you launched from your IDE).
 
@@ -38,7 +38,7 @@ This is what makes the edit-and-see-it loop feel instant — and it's required f
 
 Your app lists tasks. Let's make a row do something when you click it.
 
-**1. Add a click listener (by hand).** In `src/main/java/com/example/examplefeature/ui/TaskListView.java`, add this after the `taskGrid.addColumn(...)` block:
+**1. Add a click listener (by hand).** In `src/main/java/com/opcproxy/examplefeature/ui/TaskListView.java`, add this after the `taskGrid.addColumn(...)` block:
 
 ```java
 taskGrid.addItemClickListener(event ->

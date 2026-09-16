@@ -1,0 +1,4730 @@
+package com.opcproxy;
+
+import com.vaadin.flow.theme.aura.Aura;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+import com.vaadin.flow.component.dependency.StyleSheet;
+import com.vaadin.flow.component.page.AppShellConfigurator;
+import com.vaadin.flow.component.page.Push;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@EnableScheduling
+@SpringBootApplication
+@StyleSheet(Aura.STYLESHEET)
+@StyleSheet("styles.css") // Your custom styles
+@Push
+public class Application implements AppShellConfigurator {
+
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+
+}
+
+============================================================
+
+package com.opcproxy.config;
+
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * Глобальная конфигурация старого JInterop/Utgard OPC DA-стека.
+ *
+ * JInterop 2.1.8 получает часть параметров RPC/NTLM через
+ * системные свойства JVM. Настройки должны быть применены
+ * до первого создания OPC DA Server/JISession.
+ */
+@Slf4j
+@Configuration
+public class JInteropConfig {
+    /** Таймаут сокета j-Interop, мс. */
+    private static final String SOCKET_TIMEOUT_MS = "15000";
+
+    @PostConstruct
+    public void configure() {
+        // Читается в Server.connect(): ограничивает зависание чтений
+        // на мёртвом сокете и даёт медленным серверам время на активацию.
+        System.setProperty("rpc.socketTimeout", SOCKET_TIMEOUT_MS);
+
+        log.info("j-Interop configured: rpc.socketTimeout={} ms. "
+                        + "NTLM signing/sealing is applied by patched JIComServer (session security).",
+                SOCKET_TIMEOUT_MS);
+        /*
+         * Включает NTLM2/session security в старом RPC-стеке JInterop.
+         */
+        System.setProperty(
+                "rpc.ntlm.ntlm2",
+                "true"
+        );
+
+        /*
+         * Включает NTLM signing.
+         *
+         * В NtlmConnection.java это приводит к:
+         *
+         * Security.PROTECTION_LEVEL_INTEGRITY
+         */
+        System.setProperty(
+                "rpc.ntlm.sign",
+                "true"
+        );
+
+        /*
+         * Не включаем шифрование без необходимости.
+         *
+         * Privacy сильнее Integrity, но для текущего требования
+         * Windows достаточно уровня Packet Integrity.
+         */
+        System.clearProperty("rpc.ntlm.seal");
+
+        log.info(
+                "JInterop configured: rpc.ntlm.ntlm2=true, rpc.ntlm.sign=true"
+        );
+    }
+}
+============================================================
+
+package com.opcproxy.config;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@ConfigurationProperties(prefix = "app.opcda")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class OpcDaConfig {
+    @Builder.Default
+    private int defaultRefreshPeriodMs = 1000;
+    @Builder.Default
+    private int defaultReconnectIntervalMs = 5000;
+    @Builder.Default
+    private int maxConnections = 10;
+    @Builder.Default
+    private int connectionTimeoutMs = 10000;
+    @Builder.Default
+    private boolean enableAsyncByDefault = true;
+
+}
+============================================================
+
+package com.opcproxy.config;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+@Data
+@Configuration
+@ConfigurationProperties(prefix = "app.opcua")
+public class OpcUaConfig {
+    private int port = 4840;
+
+    private String hostname = "localhost";
+
+    private String applicationName = "OPC DA-UA Proxy";
+
+    private String applicationUri = "urn:opcproxy:ua:application";
+
+    private String namespaceUri = "urn:opcproxy:ua";
+
+    private int minPublishingIntervalMs = 100;
+
+    private int defaultSamplingIntervalMs = 1000;
+}
+============================================================
+
+package com.opcproxy.config;
+
+import com.opcproxy.ui.views.LoginView;
+import com.vaadin.flow.spring.security.VaadinSecurityConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.NoOpPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+
+
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig{
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http)
+            throws Exception {
+
+        http.with(
+                VaadinSecurityConfigurer.vaadin(),
+                vaadinSecurity ->
+                        vaadinSecurity.loginView(LoginView.class)
+        );
+
+        return http.build();
+    }
+
+    @Bean
+    public UserDetailsService userDetailsService() {
+        var user = User.builder()
+                .username("admin")
+                .password("admin")
+                .roles("ADMIN", "USER")
+                .build();
+        return new InMemoryUserDetailsManager(user);
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        // Для локальной разработки оставляем NoOp, чтобы пароль "admin" принимался как есть.
+        return NoOpPasswordEncoder.getInstance();
+    }
+
+}
+
+============================================================
+
+package com.opcproxy.opcda;
+
+public enum ConnectionState {
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    RECONNECTING,
+    FAILED
+}
+============================================================
+
+package com.opcproxy.opcda;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.enums.ReadMode;
+import lombok.Getter;
+import org.openscada.opc.dcom.da.OPCSERVERSTATUS;
+import org.openscada.opc.lib.common.ConnectionInformation;
+import org.openscada.opc.lib.da.Group;
+import org.openscada.opc.lib.da.Item;
+import org.openscada.opc.lib.da.Server;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+@Getter
+public class OpcDaClient {
+    private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
+
+    private final OpcDaConnection connectionConfig;
+    private Server server;
+    private Group group;
+
+    @Getter
+    private final Map<String, Item> items = new ConcurrentHashMap<>();
+
+    private final AtomicBoolean connected = new AtomicBoolean(false);
+    private final AtomicInteger errorCount = new AtomicInteger(0);
+    private ReadMode currentReadMode;
+    private volatile long lastDataTimestamp = System.currentTimeMillis();
+
+    public OpcDaClient(OpcDaConnection connectionConfig) {
+        this.connectionConfig = connectionConfig;
+        this.currentReadMode = connectionConfig.getDefaultReadMode();
+    }
+
+    private static final java.util.regex.Pattern CLSID_PATTERN = java.util.regex.Pattern.compile(
+            "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$"
+    );
+
+    public synchronized void connect() throws Exception {
+        if (connected.get()) {
+            log.warn("Connection {} already connected", connectionConfig.getName());
+            return;
+        }
+        log.info("Connecting to OPC DA server: {}@{}", connectionConfig.getName(), connectionConfig.getHost());
+
+        String rawId = connectionConfig.getProgIdOrClsid() != null
+                ? connectionConfig.getProgIdOrClsid().trim() : "";
+        boolean clsidMode = rawId.matches(CLSID_PATTERN.pattern());
+
+        try {
+            ConnectionInformation connInfo = new ConnectionInformation();
+            connInfo.setHost(connectionConfig.getHost());
+            connInfo.setUser(connectionConfig.getUsername());
+            connInfo.setPassword(connectionConfig.getPasswordEncrypted());
+            // ВАЖНО: домен должен передаваться явно, иначе j-Interop не сможет
+            // корректно построить NTLM-аутентификацию
+            connInfo.setDomain(connectionConfig.getDomain() != null
+                    ? connectionConfig.getDomain().trim() : "");
+
+            if (clsidMode) {
+                // Убираем фигурные скобки, Utgard сам их добавит
+                String clsid = rawId;
+                if (clsid.startsWith("{")) clsid = clsid.substring(1);
+                if (clsid.endsWith("}")) clsid = clsid.substring(0, clsid.length() - 1);
+                connInfo.setClsid(clsid.toUpperCase(java.util.Locale.ROOT));
+                log.info("Using CLSID: {}", clsid);
+            } else {
+                connInfo.setProgId(rawId);
+                log.info("Using ProgID: {} (требует доступа к реестру по SMB!)", rawId);
+            }
+
+            server = new Server(connInfo, null);
+            server.connect();
+            group = server.addGroup();
+
+            connected.set(true);
+            errorCount.set(0);
+            log.info("Successfully connected to OPC DA server: {}", connectionConfig.getName());
+        } catch (Exception e) {
+            log.error("Failed to connect to OPC DA server: {}", connectionConfig.getName(), e);
+            connected.set(false);
+            throw e;
+        }
+    }
+    /**
+     * Проверка живости канала через штатный механизм Utgard.
+     * Server.getServerState() при неудаче сам вызывает dispose() и возвращает null.
+     */
+    public boolean checkAlive() {
+        if (server == null) {
+            connected.set(false);
+            return false;
+        }
+        OPCSERVERSTATUS status = server.getServerState(); // 2.5s timeout внутри
+        if (status == null) {
+            log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
+            connected.set(false);
+            return false;
+        }
+        return true;
+    }
+    /**
+     * Реакция на ошибку уровня соединения: помечаем канал мёртвым
+     * и освобождаем сессию, чтобы checkAndReconnect поднял новую.
+     */
+    public synchronized void handleConnectionFailure(Throwable e) {
+        String msg = String.valueOf(e.getMessage());
+        boolean fatal = msg.contains("0x8001FFFF")      // j-Interop: внутренняя ошибка (мёртвый канал)
+                || msg.contains("0x80010108")            // RPC_E_DISCONNECTED
+                || msg.contains("0x800706BA")            // RPC_S_SERVER_UNAVAILABLE
+                || msg.contains("Connection reset")
+                || msg.contains("ping failed");
+        if (fatal && connected.get()) {
+            log.warn("Connection-level failure detected for {}: {} — marking lost, reconnect scheduled",
+                    connectionConfig.getName(), msg);
+            markConnectionLost();
+        }
+    }
+
+    public synchronized void markConnectionLost() {
+        connected.set(false);
+        errorCount.incrementAndGet();
+        try {
+            if (server != null) {
+                server.dispose();   // форкнет destroySession в отдельном потоке
+            }
+        } catch (Exception ex) {
+            log.debug("Dispose after failure: {}", ex.getMessage());
+        }
+    }
+
+
+    public synchronized void disconnect() {
+        if (!connected.get()) return;
+        log.info("Disconnecting from OPC DA server: {}", connectionConfig.getName());
+        try {
+            if (group != null) {
+                group.clear();
+                group = null;
+            }
+            if (server != null) {
+                server.disconnect();
+                server = null;
+            }
+            items.clear();
+            connected.set(false);
+            log.info("Disconnected from OPC DA server: {}", connectionConfig.getName());
+        } catch (Exception e) {
+            log.info("Disconnect from {} completed with cleanup note: {}",
+                    connectionConfig.getName(), e.getMessage());
+        }
+    }
+
+    /**
+     * Добавляет тег и возвращает его. Если тег уже есть, возвращает существующий.
+     */
+    public Item addItem(String itemId) throws Exception {
+        if (!connected.get() || group == null) {
+            throw new IllegalStateException("Not connected to OPC DA server");
+        }
+        if (items.containsKey(itemId)) {
+            return items.get(itemId);
+        }
+        try {
+            Item item = group.addItem(itemId);
+            items.put(itemId, item);
+            log.debug("Added item: {} to connection: {}", itemId, connectionConfig.getName());
+            return item;
+        } catch (Exception e) {
+            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Обработка разрыва DCOM-сессии
+            if (e.getMessage() != null && e.getMessage().contains("0x80010108")) {
+                log.error("DCOM object disconnected (0x80010108) for {}. Marking connection as lost.", connectionConfig.getName());
+                connected.set(false); // Это триггерит логику переподключения в OpcDaConnectionManager
+            } else {
+                log.error("Failed to add item: {} to connection: {}", itemId, connectionConfig.getName(), e);
+            }
+            throw e;
+        }
+    }
+
+    public void removeItem(String itemId) {
+        Item item = items.remove(itemId);
+        if (item != null && group != null) {
+            try {
+                group.removeItem(itemId);
+                log.debug("Removed item: {} from connection: {}", itemId, connectionConfig.getName());
+            } catch (Exception e) {
+                log.error("Failed to remove item: {} from connection: {}", itemId, connectionConfig.getName(), e);
+            }
+        }
+    }
+
+    public Map<String, Item> readAllSync() throws Exception {
+        if (!connected.get() || group == null) {
+            throw new IllegalStateException("Not connected to OPC DA server");
+        }
+        try {
+            group.read(false);
+            lastDataTimestamp = System.currentTimeMillis();
+            errorCount.set(0);
+            return items;
+        } catch (Exception e) {
+            errorCount.incrementAndGet();
+            log.error("Sync read failed for connection: {}", connectionConfig.getName(), e);
+            throw e;
+        }
+    }
+
+    public boolean isConnected() {
+        return connected.get();
+    }
+
+    public ConnectionState getState() {
+        if (connected.get()) {
+            return ConnectionState.CONNECTED;
+        }
+        return ConnectionState.DISCONNECTED;
+    }
+
+    public int getErrorCount() {
+        return errorCount.get();
+    }
+}
+============================================================
+
+package com.opcproxy.opcda;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Менеджер подключений к OPC DA серверам.
+ *
+ * Возможности:
+ *  - жизненный цикл подключений (connect / disconnect / reconnect);
+ *  - активный health-check живых подключений (Server.getServerState());
+ *  - автоматическое переподключение упавших;
+ *  - подъём подключений из БД, не сумевших подключиться при старте;
+ *  - экспоненциальный backoff для недоступных серверов (5с → 10с → ... → 60с),
+ *    чтобы зависший connect не блокировал health-check и поллинг остальных.
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class OpcDaConnectionManager {
+
+    private final OpcDaConnectionRepository connectionRepository;
+
+    /** Активные клиенты (ключ — ID подключения из БД). */
+    private final Map<Long, OpcDaClient> clients = new ConcurrentHashMap<>();
+
+    /** Время (epoch ms), раньше которого не предпринимать попыток подключения. */
+    private final Map<Long, Long> nextAttemptAt = new ConcurrentHashMap<>();
+
+    /** Счётчик последовательных неудачных попыток (для backoff). */
+    private final Map<Long, Integer> attemptCount = new ConcurrentHashMap<>();
+
+    /** Per-connection блокировки: connect к одному серверу не блокирует остальные. */
+    private final Map<Long, Object> locks = new ConcurrentHashMap<>();
+
+    private static final long RETRY_BASE_MS = 5_000;
+    private static final long RETRY_MAX_MS  = 60_000;
+
+    // ------------------------------------------------------------------
+    // Инициализация / завершение
+    // ------------------------------------------------------------------
+
+    /**
+     * Инициализация подключений при старте приложения.
+     * Ошибки отдельных подключений не прерывают запуск остальных (изоляция отказов):
+     * упавшие попадут в цикл реконнекта с backoff.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void init() {
+        log.info("Initializing OPC DA Connection Manager...");
+
+        connectionRepository.findAll().stream()
+                .filter(OpcDaConnection::getEnabled)
+                .forEach(conn -> {
+                    if (!tryConnect(conn)) {
+                        log.warn("Startup connect failed for '{}' — will retry in background (backoff)",
+                                conn.getName());
+                    }
+                });
+
+        log.info("OPC DA Connection Manager initialized. Active connections: {}", clients.size());
+    }
+
+    /** Корректное завершение всех подключений при остановке приложения. */
+    @PreDestroy
+    public void shutdown() {
+        log.info("Shutting down OPC DA Connection Manager...");
+        clients.values().forEach(OpcDaClient::disconnect);
+        clients.clear();
+        nextAttemptAt.clear();
+        attemptCount.clear();
+        locks.clear();
+    }
+
+    // ------------------------------------------------------------------
+    // Публичный API (используется UI / REST)
+    // ------------------------------------------------------------------
+
+    /**
+     * Подключает сервер (если ещё не подключён). Потокобезопасно по id подключения.
+     *
+     * @return true, если подключение установлено (или уже было активно)
+     */
+    public boolean tryConnect(OpcDaConnection connection) {
+        Long id = connection.getId();
+        synchronized (lockFor(id)) {
+            if (clients.containsKey(id)) {
+                return true;
+            }
+            try {
+                OpcDaClient client = new OpcDaClient(connection);
+                client.connect();
+                clients.put(id, client);
+                clearBackoff(id);
+                log.info("Successfully connected to OPC DA server: {}", connection.getName());
+                return true;
+            } catch (Exception e) {
+                scheduleRetry(id);
+                log.warn("Connect failed for '{}': {}", connection.getName(), e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    /** Отключает и удаляет подключение из пула. */
+    public void disconnect(Long connectionId) {
+        synchronized (lockFor(connectionId)) {
+            OpcDaClient client = clients.remove(connectionId);
+            if (client != null) {
+                client.disconnect();
+                clearBackoff(connectionId);
+                log.info("Disconnected and removed OPC DA server: {}",
+                        client.getConnectionConfig().getName());
+            }
+        }
+    }
+
+    /** Принудительное переподключение (UI / REST). Сбрасывает backoff. */
+    public void reconnect(Long connectionId) {
+        synchronized (lockFor(connectionId)) {
+            OpcDaClient client = clients.get(connectionId);
+            if (client != null) {
+                try {
+                    log.info("Forcing reconnect for: {}", client.getConnectionConfig().getName());
+                    client.disconnect();
+                    client.connect();
+                    clearBackoff(connectionId);
+                } catch (Exception e) {
+                    client.markConnectionLost();          // освободить сессию
+                    scheduleRetry(connectionId);
+                    log.error("Failed to reconnect to OPC DA server: {} ({})",
+                            client.getConnectionConfig().getName(), e.getMessage());
+                }
+            }
+        }
+    }
+
+    public Optional<OpcDaClient> getClient(Long connectionId) {
+        return Optional.ofNullable(clients.get(connectionId));
+    }
+
+    public Map<Long, OpcDaClient> getAllClients() {
+        return Map.copyOf(clients);
+    }
+
+    // ------------------------------------------------------------------
+    // Фоновый цикл: health-check + реконнект с backoff
+    // ------------------------------------------------------------------
+
+    /**
+     * Фоновая задача. Интервал — app.opcda.reconnect-check-interval-ms.
+     *
+     * 1) Для живых подключений — активный health-check (Server.getServerState();
+     *    при обрыве Utgard сам делает dispose, метод возвращает false).
+     * 2) Для мёртвых и ещё не подключённых из БД — попытка восстановления,
+     *    ограниченная экспоненциальным backoff.
+     */
+    @Scheduled(fixedDelayString = "${app.opcda.reconnect-check-interval-ms:5000}")
+    public void checkAndReconnect() {
+
+        // --- 1. Health-check и восстановление активных клиентов ---
+        clients.forEach((id, client) -> {
+            if (client.isConnected()) {
+                if (client.checkAlive()) {
+                    return; // живо
+                }
+                log.warn("Connection '{}' is dead (health check failed), will reconnect",
+                        client.getConnectionConfig().getName());
+            }
+            attemptReconnect(id);
+        });
+
+        // --- 2. Подъём подключений из БД, отсутствующих в пуле ---
+        connectionRepository.findAll().stream()
+                .filter(OpcDaConnection::getEnabled)
+                .filter(conn -> !clients.containsKey(conn.getId()))
+                .forEach(conn -> {
+                    if (!shouldTry(conn.getId())) {
+                        return; // backoff ещё не истёк
+                    }
+                    if (tryConnect(conn)) {
+                        log.info("Auto-reconnect successful for: {}", conn.getName());
+                    } else {
+                        log.debug("Still unreachable: {} (attempt #{})",
+                                conn.getName(), attemptCount.get(conn.getId()));
+                    }
+                });
+    }
+
+    private void attemptReconnect(Long id) {
+        if (!shouldTry(id)) {
+            return;
+        }
+        synchronized (lockFor(id)) {
+            OpcDaClient client = clients.get(id);
+            String name = client != null ? client.getConnectionConfig().getName() : ("id=" + id);
+            try {
+                if (client != null) {
+                    client.disconnect(); // очистка (безопасна, если уже чисто)
+                }
+                // перечитываем конфиг из БД — могли изменить через UI
+                OpcDaConnection conn = connectionRepository.findById(id).orElse(null);
+                if (conn == null || !Boolean.TRUE.equals(conn.getEnabled())) {
+                    if (client != null) {
+                        clients.remove(id);
+                    }
+                    return;
+                }
+                OpcDaClient fresh = new OpcDaClient(conn);
+                fresh.connect();
+                clients.put(id, fresh);
+                clearBackoff(id);
+                log.info("Auto-reconnect successful for: {}", name);
+            } catch (Exception e) {
+                if (client != null) {
+                    client.markConnectionLost();
+                }
+                scheduleRetry(id);
+                log.warn("Auto-reconnect failed for {}: {} (next attempt in {} ms)",
+                        name, e.getMessage(),
+                        Math.max(0, nextAttemptAt.getOrDefault(id, 0L) - System.currentTimeMillis()));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Backoff
+    // ------------------------------------------------------------------
+
+    private boolean shouldTry(Long id) {
+        return System.currentTimeMillis() >= nextAttemptAt.getOrDefault(id, 0L);
+    }
+
+    private void scheduleRetry(Long id) {
+        int attempts = attemptCount.merge(id, 1, Integer::sum);
+        // 5с → 10с → 20с → 40с → 60с (максимум)
+        long backoff = Math.min(RETRY_MAX_MS, RETRY_BASE_MS << Math.min(attempts - 1, 10));
+        nextAttemptAt.put(id, System.currentTimeMillis() + backoff);
+    }
+
+    private void clearBackoff(Long id) {
+        nextAttemptAt.remove(id);
+        attemptCount.remove(id);
+    }
+
+    private Object lockFor(Long id) {
+        return locks.computeIfAbsent(id, k -> new Object());
+    }
+}
+============================================================
+
+package com.opcproxy.opcda;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.jinterop.dcom.core.JIUnsignedByte;
+import org.jinterop.dcom.core.JIUnsignedInteger;
+import org.jinterop.dcom.core.JIUnsignedShort;
+import org.jinterop.dcom.core.JIVariant;
+import org.openscada.opc.lib.da.Item;
+import org.openscada.opc.lib.da.ItemState;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.lang.reflect.Method;
+import java.time.Instant;
+import java.util.Calendar;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TagPollingService {
+
+    private final OpcDaConnectionManager connectionManager;
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+
+    @Scheduled(fixedDelayString = "${app.opcda.polling-interval-ms:1000}")
+    public void pollTags() {
+        List<Tag> daTags = tagRepository.findBySourceType(SourceType.DA);
+
+        for (Tag tag : daTags) {
+            if (!tag.getEnabled() || tag.getConnection() == null) continue;
+
+            Long connId = tag.getConnection().getId();
+            Optional<com.opcproxy.opcda.OpcDaClient> clientOpt = connectionManager.getClient(connId);
+
+            if (clientOpt.isEmpty() || !clientOpt.get().isConnected()) {
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_NotConnected", Instant.now());
+                continue;
+            }
+
+            com.opcproxy.opcda.OpcDaClient client = clientOpt.get();
+            String itemId = tag.getSourceItemId();
+
+            if (itemId == null || itemId.isBlank()) {
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_Configuration", Instant.now());
+                continue;
+            }
+
+            try {
+                Item item = client.addItem(itemId);
+                ItemState state = item.read(false);
+
+                // 1. Распаковка JIVariant / JIUnsigned* (исправление №8, Da Client §4.3)
+                Object rawValue = state.getValue();
+                Object cleanValue = unwrapVariant(rawValue);
+
+                // 2. Качество OPC DA: 192 = Good, 64 = Bad, 80 = Uncertain
+                String quality = parseOpcQuality(state.getQuality());
+
+                // 3. Значение при качестве != Good — null (исправление №15)
+                if (!quality.startsWith("Good")) {
+                    cleanValue = null;
+                }
+
+                Calendar calendar = state.getTimestamp();
+                Instant timestamp = calendar != null ? calendar.toInstant() : Instant.now();
+
+                tagRegistry.updateTagValue(tag.getId(), cleanValue, quality, timestamp);
+
+            } catch (Exception e) {
+                // Ошибки уровня соединения помечают канал мёртвым → реконнект через ≤5 сек
+                client.handleConnectionFailure(e);
+                log.debug("Failed to read tag {} ({}): {}", tag.getName(), itemId, e.getMessage());
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_CommunicationFailure", Instant.now());
+            }
+        }
+    }
+
+    /** Распаковка JIVariant и беззнаковых типов j-Interop в стандартные Java-типы. */
+    private Object unwrapVariant(Object raw) {
+        if (raw == null) return null;
+
+        if (raw instanceof JIVariant variant) {
+            try {
+                return unwrapVariant(variant.getObject());
+            } catch (Exception e) {
+                return raw;
+            }
+        }
+        if (raw instanceof JIUnsignedByte b) return b.getValue();    // 0..255
+        if (raw instanceof JIUnsignedShort s) return s.getValue();   // 0..65535
+        if (raw instanceof JIUnsignedInteger i) return i.getValue(); // 0..4294967295
+
+        // Fallback для прочих JIUnsigned* через рефлексию
+        if (raw.getClass().getName().startsWith("org.jinterop.dcom.core.JIUnsigned")) {
+            try {
+                Method getValue = raw.getClass().getMethod("getValue");
+                return getValue.invoke(raw);
+            } catch (Exception ignore) { }
+        }
+        return raw;
+    }
+
+    /** Старшие 2 бита кода качества OPC DA определяют статус. */
+    private String parseOpcQuality(int q) {
+        int status = q & 0xC0;
+        if (status == 0xC0) return "Good";
+        if (status == 0x40) return "Bad";
+        if (status == 0x80) return "Uncertain";
+        return "Bad_Unknown";
+    }
+}
+============================================================
+
+package com.opcproxy.opcua;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.tags.TagValueUpdatedEvent;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.milo.opcua.sdk.core.AccessLevel;
+import org.eclipse.milo.opcua.sdk.core.Reference;
+import org.eclipse.milo.opcua.sdk.server.ManagedNamespaceWithLifecycle;
+import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.items.DataItem;
+import org.eclipse.milo.opcua.sdk.server.items.MonitoredItem;
+import org.eclipse.milo.opcua.sdk.server.nodes.UaFolderNode;
+import org.eclipse.milo.opcua.sdk.server.nodes.UaVariableNode;
+import org.eclipse.milo.opcua.stack.core.Identifiers;
+import org.eclipse.milo.opcua.stack.core.types.builtin.*;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AddressSpaceBuilder {
+
+    private final TagRegistry tagRegistry;
+    private final TagRepository tagRepository;
+    private final OpcDaConnectionRepository connectionRepository;
+    private volatile boolean built = false;
+    private CustomNamespace namespace;
+    private final Map<Long, NodeId> tagIdToNodeIdMap = new ConcurrentHashMap<>();
+
+    public void build(OpcUaServer server) {
+        if (built) {
+            log.warn("Address Space already built, skipping duplicate invocation");
+            return;
+        }
+        built = true;
+        namespace = new CustomNamespace(server, "urn:opcproxy:ua");
+
+        namespace.startup();
+
+        buildAddressSpace();
+    }
+
+    private void buildAddressSpace() {
+        log.info("Building OPC UA Address Space...");
+
+        // 1. Создаем корневую папку "Tags"
+        UaFolderNode tagsFolder = new UaFolderNode(
+                namespace.getNodeContext(),
+                new NodeId(namespace.getNamespaceIndex(), "Tags"),
+                new QualifiedName(namespace.getNamespaceIndex(), "Tags"),
+                LocalizedText.english("Tags")
+        );
+        namespace.getNodeManager().addNode(tagsFolder);
+        tagsFolder.addReference(new Reference(
+                tagsFolder.getNodeId(),
+                Identifiers.Organizes,
+                Identifiers.ObjectsFolder.expanded(),
+                false
+        ));
+
+        // 2. Создаем корневую папку "Sources"
+        UaFolderNode sourcesFolder = new UaFolderNode(
+                namespace.getNodeContext(),
+                new NodeId(namespace.getNamespaceIndex(), "Sources"),
+                new QualifiedName(namespace.getNamespaceIndex(), "Sources"),
+                LocalizedText.english("Sources")
+        );
+        namespace.getNodeManager().addNode(sourcesFolder);
+        sourcesFolder.addReference(new Reference(
+                sourcesFolder.getNodeId(),
+                Identifiers.Organizes,
+                Identifiers.ObjectsFolder.expanded(),
+                false
+        ));
+
+        log.info("Building OPC UA Address Space...");
+
+        // ... создание папок Tags и Sources без изменений ...
+
+        // Загружаем теги из БД вместе с connection (fetch join — нет Lazy-прокси)
+        List<Tag> tags = tagRepository.findAllEnabledWithConnection();
+        for (Tag tag : tags) {
+            createTagNode(tag, tagsFolder, sourcesFolder);
+        }
+
+        log.info("Address Space built successfully. Total enabled tags: {}", tags.size());
+    }
+
+    private void createTagNode(Tag tag, UaFolderNode tagsFolder, UaFolderNode sourcesFolder) {
+        String tagName = tag.getName();
+        NodeId nodeId = new NodeId(namespace.getNamespaceIndex(), tagName);
+        QualifiedName browseName = new QualifiedName(namespace.getNamespaceIndex(), tagName);
+
+        Object initialValue = tagRegistry.getTagValue(tag.getId())
+                .map(TagRegistry.TagValue::getValue)
+                .orElse(null);
+
+        UaVariableNode variableNode = new UaVariableNode.UaVariableNodeBuilder(namespace.getNodeContext())
+                .setNodeId(nodeId)
+                .setBrowseName(browseName)
+                .setDisplayName(LocalizedText.english(tagName))
+                .setDataType(getOpcUaDataType(tag.getDataType().name()))
+                .setTypeDefinition(Identifiers.BaseDataVariableType)
+                .setAccessLevel(EnumSet.of(AccessLevel.CurrentRead))
+                .setUserAccessLevel(EnumSet.of(AccessLevel.CurrentRead))
+                .setValue(new DataValue(new Variant(initialValue)))
+                .build();
+
+        namespace.getNodeManager().addNode(variableNode);
+        tagIdToNodeIdMap.put(tag.getId(), nodeId);
+
+        // Ссылка из плоской папки (используем удобный метод addOrganizes)
+        tagsFolder.addOrganizes(variableNode);
+
+        // Ссылка из иерархической папки
+        if (tag.getConnection() != null) {
+            String connName = tag.getConnection().getName();
+            NodeId connFolderId = new NodeId(namespace.getNamespaceIndex(), "Sources/" + connName);
+
+            // Пытаемся найти существующую папку, если нет - создаем
+            UaFolderNode connFolder = (UaFolderNode) namespace.getNodeManager().getNode(connFolderId).orElse(null);
+            if (connFolder == null) {
+                connFolder = new UaFolderNode(
+                        namespace.getNodeContext(),
+                        connFolderId,
+                        new QualifiedName(namespace.getNamespaceIndex(), connName),
+                        LocalizedText.english(connName)
+                );
+                namespace.getNodeManager().addNode(connFolder);
+                sourcesFolder.addOrganizes(connFolder);
+            }
+            connFolder.addOrganizes(variableNode);
+        }
+    }
+
+    @EventListener
+    public void onTagValueUpdated(TagValueUpdatedEvent event) {
+        NodeId nodeId = tagIdToNodeIdMap.get(event.getTagId());
+        if (nodeId != null && namespace != null) {
+            var node = (UaVariableNode) namespace.getNodeManager().getNode(nodeId).orElse(null);
+            if (node != null) {
+                StatusCode statusCode = "Good".equalsIgnoreCase(event.getQuality()) ? StatusCode.GOOD : new StatusCode(0x80000000L);
+                Instant serverTime = Instant.now();
+                DateTime sourceDateTime = event.getSourceTimestamp() != null ? new DateTime(event.getSourceTimestamp()) : new DateTime(serverTime);
+
+                DataValue dataValue = new DataValue(
+                        new Variant(event.getValue()),
+                        statusCode,
+                        sourceDateTime,
+                        new DateTime(serverTime)
+                );
+                node.setValue(dataValue);
+            }
+        }
+    }
+
+    private NodeId getOpcUaDataType(String javaDataType) {
+        return switch (javaDataType.toUpperCase()) {
+            case "BOOLEAN" -> Identifiers.Boolean;
+            case "INT16" -> Identifiers.Int16;
+            case "UINT16" -> Identifiers.UInt16;
+            case "INT32" -> Identifiers.Int32;
+            case "UINT32" -> Identifiers.UInt32;
+            case "FLOAT" -> Identifiers.Float;
+            case "DOUBLE" -> Identifiers.Double;
+            case "STRING" -> Identifiers.String;
+            case "DATETIME" -> Identifiers.DateTime;
+            default -> Identifiers.BaseDataType;
+        };
+    }
+
+    // Наследуемся от ManagedNamespaceWithLifecycle как в официальном примере ExampleNamespace.java
+    private class CustomNamespace extends ManagedNamespaceWithLifecycle {
+        protected CustomNamespace(OpcUaServer server, String namespaceUri) {
+            super(server, namespaceUri);
+        }
+
+        @Override
+        public void onDataItemsCreated(List<DataItem> dataItems) {
+            // Логика при создании подписок (можно оставить пустой для базовой реализации)
+        }
+
+        @Override
+        public void onDataItemsModified(List<DataItem> dataItems) {}
+
+        @Override
+        public void onDataItemsDeleted(List<DataItem> dataItems) {}
+
+        @Override
+        public void onMonitoringModeChanged(List<MonitoredItem> monitoredItems) {}
+    }
+}
+============================================================
+
+package com.opcproxy.opcua;
+
+import com.opcproxy.config.OpcUaConfig;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.milo.opcua.sdk.server.EndpointConfig;
+import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.OpcUaServerConfig;
+import org.eclipse.milo.opcua.sdk.server.identity.AnonymousIdentityValidator;
+import org.eclipse.milo.opcua.sdk.server.identity.CompositeValidator;
+import org.eclipse.milo.opcua.sdk.server.identity.UsernameIdentityValidator;
+import org.eclipse.milo.opcua.stack.core.security.SecurityPolicy;
+import org.eclipse.milo.opcua.stack.core.transport.TransportProfile;
+import org.eclipse.milo.opcua.stack.core.types.builtin.LocalizedText;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.MessageSecurityMode;
+import org.eclipse.milo.opcua.stack.transport.server.OpcServerTransportFactory;
+import org.eclipse.milo.opcua.stack.transport.server.tcp.OpcTcpServerTransport;
+import org.eclipse.milo.opcua.stack.transport.server.tcp.OpcTcpServerTransportConfig;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+
+import java.net.InetAddress;
+import java.util.LinkedHashSet;
+import java.util.Set;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class OpcUaServerManager implements DisposableBean {
+
+    private final OpcUaConfig config;
+    private final AddressSpaceBuilder addressSpaceBuilder;
+
+    @Getter
+    private volatile OpcUaServer server;
+
+    private volatile boolean started = false;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void start() throws Exception {
+        if (started) return;
+        started = true;
+        doStart();
+    }
+
+    private void doStart() throws Exception {
+        if (server != null) {
+            log.warn("OPC UA server already started");
+            return;
+        }
+
+        UsernameIdentityValidator usernameValidator = new UsernameIdentityValidator(
+                authChallenge -> "opcuser".equals(authChallenge.getUsername()) && "opcpassword".equals(authChallenge.getPassword())
+        );
+
+        OpcUaServerConfig serverConfig = OpcUaServerConfig.builder()
+                .setApplicationName(LocalizedText.english(config.getApplicationName()))
+                .setApplicationUri(config.getApplicationUri())
+                .setProductUri(config.getApplicationUri())
+                .setIdentityValidator(new CompositeValidator(new AnonymousIdentityValidator(), usernameValidator))
+                .setEndpoints(createEndpointConfigs())
+                .build();
+
+        OpcServerTransportFactory transportFactory = transportProfile -> {
+            if (transportProfile == TransportProfile.TCP_UASC_UABINARY) {
+                return new OpcTcpServerTransport(OpcTcpServerTransportConfig.newBuilder().build());
+            }
+            throw new IllegalArgumentException("Unsupported transport: " + transportProfile);
+        };
+
+        server = new OpcUaServer(serverConfig, transportFactory);
+        addressSpaceBuilder.build(server);
+
+        try {
+            server.startup().get();
+            log.info("OPC UA server started at opc.tcp://{}:{}", hostname(), config.getPort());
+        } catch (Exception e) {
+            server = null;
+            log.error("OPC UA server failed to start (port {} busy?): {}. " +
+                    "Gateway continues without OPC UA server.", config.getPort(), e.getMessage());
+            // не пробрасываем — приложение живёт, DA-слой работает
+        }
+    }
+
+    public synchronized void stop() {
+        OpcUaServer s = server;
+        server = null;
+        if (s != null) {
+            try {
+                s.shutdown().get();
+                log.info("OPC UA server stopped");
+            } catch (Exception e) {
+                log.warn("Error during OPC UA server shutdown (server may not have been started): {}", e.getMessage());
+            }
+        }
+    }
+
+    public boolean isRunning() { return server != null; }
+    public int getBindPort() { return config.getPort(); }
+
+    @Override
+    public void destroy() throws Exception {
+        stop();
+    }
+
+    private Set<EndpointConfig> createEndpointConfigs() {
+        Set<EndpointConfig> endpoints = new LinkedHashSet<>();
+        endpoints.add(
+                EndpointConfig.newBuilder()
+                        .setHostname(hostname())
+                        .setBindAddress("0.0.0.0")
+                        .setBindPort(config.getPort())
+                        .setTransportProfile(TransportProfile.TCP_UASC_UABINARY)
+                        .setSecurityPolicy(SecurityPolicy.None)
+                        .setSecurityMode(MessageSecurityMode.None)
+                        .build()
+        );
+        return endpoints;
+    }
+
+    private static String hostname() {
+        try { return InetAddress.getLocalHost().getHostName(); }
+        catch (Exception e) { return "localhost"; }
+    }
+}
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@Entity
+@Table(name = "audit_log")
+public class AuditLog {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @EqualsAndHashCode.Include
+    private Long id;
+
+    @Column(nullable = false)
+    private LocalDateTime timestamp;
+
+    private String actor;
+    @Column(nullable = false)
+    private String action;
+    @Column(name = "entity_type", nullable = false)
+    private String entityType;
+    @Column(name = "entity_id")
+    private Long entityId;
+    @Column(name = "old_value", columnDefinition = "TEXT")
+    private String oldValue;
+    @Column(name = "new_value", columnDefinition = "TEXT")
+    private String newValue;
+    @Column(columnDefinition = "TEXT")
+    private String details;
+
+
+    @PrePersist
+    protected void onCreate() {
+        if (timestamp == null) timestamp = LocalDateTime.now();
+    }
+}
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@Entity
+@Table(name = "interval_profile")
+public class IntervalProfile {
+
+    @Id
+    @EqualsAndHashCode.Include
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String name;
+
+    @Column(name = "ua_sampling_interval_ms", nullable = false)
+    private Integer uaSamplingIntervalMs = 1000;
+
+    @Column(name = "mqtt_publish_interval_ms")
+    private Integer mqttPublishIntervalMs;
+
+    @Column(name = "mqtt_deadband")
+    private Float mqttDeadband;
+
+    private String description;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = updatedAt = LocalDateTime.now();
+    }
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
+
+}
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import com.opcproxy.persistence.enums.ReadMode;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import java.time.LocalDateTime;
+
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@Entity
+@Table(name = "opc_da_connection")
+public class OpcDaConnection {
+
+    @Id
+    @EqualsAndHashCode.Include
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String name;
+
+    @Column(nullable = false)
+    private String host;
+
+    @Column(name = "prog_id_or_clsid", nullable = false)
+    private String progIdOrClsid;
+
+    private String username;
+
+    // ДОБАВЛЕНО: Явное указание колонки с дефолтным значением
+    @Column(name = "domain", nullable = false, columnDefinition = "VARCHAR(255) DEFAULT ''")
+    private String domain = "";
+
+    @Column(name = "password_encrypted")
+    private String passwordEncrypted;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "default_read_mode", nullable = false)
+    private ReadMode defaultReadMode = ReadMode.ASYNC;
+
+    @Column(name = "default_refresh_period_ms", nullable = false)
+    private Integer defaultRefreshPeriodMs = 1000;
+
+    @Column(name = "reconnect_interval_ms", nullable = false)
+    private Integer reconnectIntervalMs = 5000;
+
+    @Column(nullable = false)
+    private Boolean enabled = true;
+
+    private String description;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+        updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
+}
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@Entity
+@Table(name = "system_setting")
+public class SystemSetting {
+    @Id
+    private String key;
+    @Column(nullable = false, columnDefinition = "TEXT")
+    private String value;
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+    @PrePersist @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
+}
+
+
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import com.opcproxy.persistence.enums.DataType;
+import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.persistence.enums.SourceType;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@Entity
+@Table(name = "tag")
+public class Tag {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @EqualsAndHashCode.Include
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "source_type", nullable = false)
+    private SourceType sourceType;
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "connection_id")
+    private OpcDaConnection connection;
+
+    @Column(name = "source_item_id", length = 512)
+    private String sourceItemId;
+
+    @Column(columnDefinition = "TEXT")
+    private String expression;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "data_type", nullable = false)
+    private DataType dataType;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "read_mode", nullable = false)
+    private ReadMode readMode = ReadMode.ASYNC;
+
+    @Column(name = "refresh_period_ms", nullable = false)
+    private Integer refreshPeriodMs = 1000;
+
+    @Column(name = "ua_sampling_interval_ms")
+    private Integer uaSamplingIntervalMs;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "interval_profile_id")
+    private IntervalProfile intervalProfile;
+
+    @Column(name = "publish_mqtt", nullable = false)
+    private Boolean publishMqtt = false;
+
+    @Column(name = "mqtt_deadband")
+    private Float mqttDeadband;
+
+    private String description;
+
+    @Column(nullable = false)
+    private Boolean enabled = true;
+
+    @Version
+    private Integer version;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist protected void onCreate() { createdAt = updatedAt = LocalDateTime.now(); }
+    @PreUpdate protected void onUpdate() { updatedAt = LocalDateTime.now(); }
+
+}
+============================================================
+
+package com.opcproxy.persistence.entity;
+
+import com.opcproxy.persistence.enums.UserRole;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+@AllArgsConstructor
+@NoArgsConstructor
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@Entity
+@Table(name = "user_account")
+public class UserAccount {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @EqualsAndHashCode.Include
+    private Long id;
+    @Column(nullable = false, unique = true) private String username;
+    @Column(name = "password_hash", nullable = false) private String passwordHash;
+    @Enumerated(EnumType.STRING) @Column(nullable = false) private UserRole role = UserRole.USER;
+    @Column(nullable = false) private Boolean enabled = true;
+    @Column(name = "created_at", updatable = false) private LocalDateTime createdAt;
+    @Column(name = "updated_at") private LocalDateTime updatedAt;
+    @PrePersist protected void onCreate() { createdAt = updatedAt = LocalDateTime.now(); }
+    @PreUpdate protected void onUpdate() { updatedAt = LocalDateTime.now(); }
+}
+============================================================
+
+package com.opcproxy.persistence.enums;
+
+public enum DataType {
+    BOOLEAN, INT16, UINT16, INT32, UINT32, FLOAT, DOUBLE, STRING, DATETIME, BYTE, SBYTE
+}
+
+============================================================
+
+package com.opcproxy.persistence.enums;
+
+public enum ReadMode {
+    AUTO, ASYNC, SYNC
+}
+
+============================================================
+
+package com.opcproxy.persistence.enums;
+
+public enum SourceType {
+    DA, CALC
+}
+
+============================================================
+
+package com.opcproxy.persistence.enums;
+
+public enum UserRole {
+    ADMIN, USER
+}
+
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.AuditLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface AuditLogRepository extends JpaRepository<AuditLog, Long> {
+}
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.IntervalProfile;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface IntervalProfileRepository extends JpaRepository<IntervalProfile, Long> {
+    Optional<IntervalProfile> findByName(String name);
+}
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface OpcDaConnectionRepository extends JpaRepository<OpcDaConnection, Long> {
+    Optional<OpcDaConnection> findByName(String name);
+    boolean existsByName(String name);
+}
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.SystemSetting;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface SystemSettingRepository extends JpaRepository<SystemSetting, String> {
+}
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.SourceType;
+import org.springframework.data.jpa.repository.EntityGraph;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface TagRepository extends JpaRepository<Tag, Long> {
+
+    @Query("select t from Tag t")
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    List<Tag> findAll();
+
+    Optional<Tag> findByName(String name);
+    boolean existsByName(String name);
+
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    List<Tag> findByConnectionId(Long connectionId);
+
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    List<Tag> findBySourceType(SourceType sourceType);
+
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    @Query("SELECT t FROM Tag t WHERE t.enabled = true")
+    List<Tag> findAllEnabled();
+
+    /**
+     * Загружает включенные теги вместе с подключением (LEFT JOIN FETCH),
+     * чтобы обращение к tag.getConnection().getName() не вызывало
+     * LazyInitializationException вне транзакции.
+     */
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    @Query("SELECT DISTINCT t FROM Tag t LEFT JOIN FETCH t.connection WHERE t.enabled = true")
+    List<Tag> findAllEnabledWithConnection();
+}
+============================================================
+
+package com.opcproxy.persistence.repository;
+
+import com.opcproxy.persistence.entity.UserAccount;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface UserAccountRepository extends JpaRepository<UserAccount, Long> {
+    Optional<UserAccount> findByUsername(String username);
+}
+============================================================
+
+package com.opcproxy.tags;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.TagRepository;
+import org.slf4j.Logger;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+public class TagRegistry {
+
+    private static final Logger log = LoggerFactory.getLogger(TagRegistry.class);
+    private final ApplicationEventPublisher eventPublisher;
+    private final TagRepository tagRepository;
+    private final Map<Long, TagValue> tagValues = new ConcurrentHashMap<>();
+
+    public TagRegistry(ApplicationEventPublisher eventPublisher, TagRepository tagRepository) {
+        this.eventPublisher = eventPublisher;
+        this.tagRepository = tagRepository;
+    }
+
+    private volatile boolean initialized = false;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void init() {
+        if (initialized) return;
+        initialized = true;
+        log.info("Initializing Tag Registry");
+
+        // Загружаем все активные теги из БД
+        tagRepository.findAllEnabled().forEach(tag -> {
+            tagValues.put(tag.getId(), new TagValue(tag.getName()));
+        });
+
+        log.info("Tag Registry initialized with {} tags", tagValues.size());
+    }
+
+    // В методе updateTagValue:
+    public void updateTagValue(Long tagId, Object value, String quality, Instant timestamp) {
+        TagValue tagValue = tagValues.get(tagId);
+        if (tagValue != null) {
+            boolean changed = !Objects.equals(tagValue.getValue(), value)
+                    || !Objects.equals(tagValue.getQuality(), quality);
+            tagValue.setValue(value);
+            tagValue.setQuality(quality);
+            tagValue.setTimestamp(timestamp);
+
+            if (changed) {
+                eventPublisher.publishEvent(new TagValueUpdatedEvent(this, tagId, value, quality, timestamp));
+            }
+        }
+    }
+
+    public Optional<TagValue> getTagValue(Long tagId) {
+        return Optional.ofNullable(tagValues.get(tagId));
+    }
+
+    public Optional<TagValue> getTagValueByName(String tagName) {
+        return tagValues.values().stream()
+                .filter(tv -> tv.getName().equals(tagName))
+                .findFirst();
+    }
+
+    public Map<Long, TagValue> getAllTagValues() {
+        return Map.copyOf(tagValues);
+    }
+
+    public void registerTag(Tag tag) {
+        tagValues.put(tag.getId(), new TagValue(tag.getName()));
+        log.debug("Registered tag: {}", tag.getName());
+    }
+
+    public void unregisterTag(Long tagId) {
+        tagValues.remove(tagId);
+        log.debug("Unregistered tag: {}", tagId);
+    }
+
+    public static class TagValue {
+        private final String name;
+        private volatile Object value;
+        private volatile String quality = "Bad";
+        private volatile Instant timestamp = Instant.now();
+
+        public TagValue(String name) {
+            this.name = name;
+        }
+
+        public String getName() { return name; }
+        public Object getValue() { return value; }
+        public void setValue(Object value) { this.value = value; }
+        public String getQuality() { return quality; }
+        public void setQuality(String quality) { this.quality = quality; }
+        public Instant getTimestamp() { return timestamp; }
+        public void setTimestamp(Instant timestamp) { this.timestamp = timestamp; }
+    }
+}
+============================================================
+
+package com.opcproxy.tags;
+
+import lombok.Getter;
+import org.springframework.context.ApplicationEvent;
+import java.time.Instant;
+
+@Getter
+public class TagValueUpdatedEvent extends ApplicationEvent {
+    private final Long tagId;
+    private final Object value;
+    private final String quality;
+    private final Instant sourceTimestamp; // Переименовано, чтобы не конфликтовать с ApplicationEvent.getTimestamp()
+
+    public TagValueUpdatedEvent(Object source, Long tagId, Object value, String quality,
+                                Instant sourceTimestamp) {
+        super(source);
+        this.tagId = tagId;
+        this.value = value;
+        this.quality = quality;
+        this.sourceTimestamp = sourceTimestamp;
+//        this.timestamp = sourceTimestamp; // Для совместимости, если нужно
+    }
+
+    // Явный геттер для timestamp, если он нужен в другом месте
+    public Instant getEventTimestamp() {
+        return sourceTimestamp;
+    }
+}
+============================================================
+
+package com.opcproxy.ui;
+
+import com.opcproxy.ui.views.ConnectionsView;
+import com.opcproxy.ui.views.DashboardView;
+import com.opcproxy.ui.views.TagsView;
+import com.vaadin.flow.component.applayout.AppLayout;
+import com.vaadin.flow.component.html.H1;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.sidenav.SideNav;
+import com.vaadin.flow.component.sidenav.SideNavItem;
+import com.vaadin.flow.router.Layout;
+import com.vaadin.flow.router.RouterLayout;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+
+@Layout
+@PermitAll
+public class MainLayout extends AppLayout implements RouterLayout {
+
+    public MainLayout() {
+        createHeader();
+        createDrawer();
+    }
+
+    private void createHeader() {
+        H1 logo = new H1("OPC DA-UA Proxy");
+        logo.addClassNames(LumoUtility.FontSize.LARGE, LumoUtility.Margin.MEDIUM);
+
+        HorizontalLayout header = new HorizontalLayout(logo);
+        header.setDefaultVerticalComponentAlignment(FlexComponent.Alignment.CENTER);
+        header.setWidthFull();
+        header.addClassNames(LumoUtility.Padding.Vertical.NONE, LumoUtility.Padding.Horizontal.MEDIUM);
+
+        addToNavbar(header);
+    }
+
+    private void createDrawer() {
+        VerticalLayout drawerLayout = new VerticalLayout();
+        drawerLayout.addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+
+        SideNav nav = new SideNav();
+        nav.addItem(new SideNavItem("Dashboard", DashboardView.class));
+        // В методе createDrawer() добавьте:
+        nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
+        // В следующих этапах добавим сюда остальные вьюшки:
+        // nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
+        // nav.addItem(new SideNavItem("Tags", TagsView.class));
+        // Внутри метода createDrawer() класса MainLayout.java
+        nav.addItem(new SideNavItem("Tags", TagsView.class));
+
+        drawerLayout.add(nav);
+        addToDrawer(drawerLayout);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaClient;
+import com.opcproxy.opcda.OpcDaConnectionManager;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.Optional;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ConnectionService {
+
+    private final OpcDaConnectionRepository connectionRepository;
+    private final OpcDaConnectionManager connectionManager;
+
+    public List<OpcDaConnection> findAll() {
+        return connectionRepository.findAll();
+    }
+
+    public Optional<OpcDaConnection> findById(Long id) {
+        return connectionRepository.findById(id);
+    }
+
+    public boolean existsByName(String name) {
+        return connectionRepository.existsByName(name);
+    }
+
+    @Transactional
+    public OpcDaConnection save(OpcDaConnection connection) {
+        OpcDaConnection saved = connectionRepository.save(connection);
+
+        if (Boolean.TRUE.equals(saved.getEnabled())) {
+            // Переподключаем с актуальной конфигурацией.
+            // disconnect старого клиента нужен, чтобы подхватить изменённые
+            // host/CLSID/учётные данные, а не переиспользовать старую сессию.
+            connectionManager.disconnect(saved.getId());
+            if (connectionManager.tryConnect(saved)) {
+                log.info("Connection '{}' (re)connected after save", saved.getName());
+            } else {
+                // Не блокируем сохранение: клиент попадёт в цикл реконнекта с backoff
+                // и подключится, как только сервер станет доступен
+                log.warn("Connection '{}' saved but not connected — background reconnect scheduled",
+                        saved.getName());
+            }
+        } else {
+            connectionManager.disconnect(saved.getId());
+        }
+
+        return saved;
+    }
+
+    @Transactional
+    public void delete(Long id) {
+        connectionManager.disconnect(id);
+        connectionRepository.deleteById(id);
+    }
+
+    public ConnectionState getStatus(Long id) {
+        return connectionManager.getClient(id)
+                .map(OpcDaClient::getState)
+                .orElse(ConnectionState.DISCONNECTED);
+    }
+
+    public int getErrorCount(Long id) {
+        return connectionManager.getClient(id)
+                .map(OpcDaClient::getErrorCount)
+                .orElse(0);
+    }
+
+    public String testConnection(OpcDaConnection connection) {
+        OpcDaClient testClient = new OpcDaClient(connection);
+        try {
+            testClient.connect();
+            testClient.disconnect();
+            return "Подключение успешно установлено";
+        } catch (Exception e) {
+            log.error("Test connection failed for: {}", connection.getName(), e);
+
+            String errorMsg = e.getMessage();
+            if (errorMsg != null && (errorMsg.contains("0xC0000001") || errorMsg.contains("SmbException"))) {
+                return "⚠️ Ошибка DCOM/SMB: Windows блокирует доступ к реестру.\n\n" +
+                        "Решение 1 (быстрое): Используйте CLSID (GUID) вместо ProgID.\n" +
+                        "Решение 2: Выполните в PowerShell (Admin):\n" +
+                        "New-ItemProperty -Path 'HKLM:\\...\\System' -Name 'LocalAccountTokenFilterPolicy' -Value 1 -Force\n" +
+                        "и перезагрузите ПК.";
+            } else if (errorMsg != null && errorMsg.contains("Class not registered")) {
+                return "❌ Ошибка: ProgID/CLSID не найден в реестре Windows.";
+            } else if (errorMsg != null && errorMsg.contains("Access is denied")) {
+                return "🔒 Ошибка доступа: Проверьте логин (формат '.\\User'), пароль и права DCOM (dcomcnfg).";
+            }
+
+            return "Ошибка подключения: " + e.getMessage();
+        }
+    }
+    public void reconnect(Long id) {
+        connectionManager.reconnect(id);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.opcda.OpcDaConnectionManager;
+import com.opcproxy.opcua.OpcUaServerManager;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Сервис для агрегации данных, необходимых для отображения на главной панели мониторинга (Dashboard).
+ */
+@Service
+@RequiredArgsConstructor
+public class DashboardService {
+
+    private final OpcDaConnectionManager connectionManager;
+    private final OpcUaServerManager opcUaServerManager;
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+
+    /**
+     * DTO для отображения статуса OPC DA подключения в UI.
+     */
+    public record ConnectionStatusDto(
+            Long id,
+            String name,
+            String host,
+            String state,
+            int errorCount
+    ) {}
+
+    /**
+     * Получает список статусов всех OPC DA подключений, находящихся в менеджере.
+     */
+    public List<ConnectionStatusDto> getConnectionStatuses() {
+        return connectionManager.getAllClients().values().stream()
+                .map(client -> new ConnectionStatusDto(
+                        client.getConnectionConfig().getId(),
+                        client.getConnectionConfig().getName(),
+                        client.getConnectionConfig().getHost(),
+                        client.getState().name(),
+                        client.getErrorCount()
+                ))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * DTO для сводной статистики по качеству тегов.
+     */
+    public record TagStatsDto(
+            long total,
+            long good,
+            long bad,
+            long uncertain
+    ) {}
+
+    /**
+     * Подсчитывает количество тегов в разрезе их текущего качества (Good/Bad/Uncertain).
+     * Данные берутся из реестра тегов в памяти (TagRegistry).
+     */
+    public TagStatsDto getTagStats() {
+        List<Tag> tags = tagRepository.findAllEnabled();
+        long total = tags.size();
+        long good = 0, bad = 0, uncertain = 0;
+
+        for (Tag tag : tags) {
+            // Получаем качество из реестра, если тега нет в реестре - считаем Bad
+            String quality = tagRegistry.getTagValue(tag.getId())
+                    .map(TagRegistry.TagValue::getQuality)
+                    .orElse("Bad");
+
+            if (quality.startsWith("Good")) {
+                good++;
+            } else if (quality.startsWith("Bad")) {
+                bad++;
+            } else if (quality.startsWith("Uncertain")) {
+                uncertain++;
+            }
+        }
+
+        return new TagStatsDto(total, good, bad, uncertain);
+    }
+
+    /**
+     * Проверяет, запущен ли встроенный OPC UA сервер.
+     */
+    public boolean isOpcUaServerRunning() {
+        return opcUaServerManager.isRunning();
+    }
+
+    /**
+     * Возвращает порт, на котором слушает OPC UA сервер.
+     */
+    public int getOpcUaServerPort() {
+        return opcUaServerManager.getBindPort();
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.Optional;
+
+@Service
+@RequiredArgsConstructor
+public class TagService {
+
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+
+    public List<Tag> findAll() {
+        return tagRepository.findAll();
+    }
+
+    public Optional<Tag> findById(Long id) {
+        return tagRepository.findById(id);
+    }
+
+    public boolean existsByName(String name) {
+        return tagRepository.existsByName(name);
+    }
+
+    @Transactional
+    public Tag save(Tag tag) {
+        Tag saved = tagRepository.save(tag);
+        tagRegistry.registerTag(saved);   // тег появляется в реестре сразу
+        return saved;
+    }
+
+    @Transactional
+    public void delete(Long id) {
+        tagRegistry.unregisterTag(id);
+        tagRepository.deleteById(id);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.ui.services.ConnectionService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.combobox.ComboBox;
+import com.vaadin.flow.component.dialog.Dialog;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.textfield.IntegerField;
+import com.vaadin.flow.component.textfield.PasswordField;
+import com.vaadin.flow.component.textfield.TextArea;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.data.binder.Binder;
+import com.vaadin.flow.data.validator.StringLengthValidator;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class ConnectionsDialog extends Dialog {
+
+    private final ConnectionService connectionService;
+    private final Runnable onSaveCallback;
+
+    private final TextField nameField = new TextField("Connection Name");
+    private final TextField hostField = new TextField("Hostname / IP");
+    private final TextField progIdField = new TextField("ProgID or CLSID");
+    private final TextField domainField = new TextField("Domain (optional)");
+    private final TextField usernameField = new TextField("Username");
+    private final PasswordField passwordField = new PasswordField("Password");
+    private final ComboBox<ReadMode> readModeBox = new ComboBox<>("Default Read Mode");
+    private final IntegerField refreshPeriodField = new IntegerField("Refresh Period (ms)");
+    private final IntegerField reconnectIntervalField = new IntegerField("Reconnect Interval (ms)");
+    private final Checkbox enabledCheckbox = new Checkbox("Enabled");
+    private final TextArea descriptionArea = new TextArea("Description");
+
+    private final Binder<OpcDaConnection> binder = new Binder<>(OpcDaConnection.class);
+    private OpcDaConnection currentConnection;
+
+    public ConnectionsDialog(ConnectionService connectionService, Runnable onSaveCallback) {
+        this.connectionService = connectionService;
+        this.onSaveCallback = onSaveCallback;
+
+        setHeaderTitle("OPC DA Connection");
+        setCloseOnOutsideClick(false);
+        setWidth("550px");
+
+        configureFields();
+        configureBinder();
+        buildLayout();
+    }
+
+    private void configureFields() {
+        nameField.setRequired(true);
+        nameField.setPlaceholder("e.g., PLC_Server_1");
+
+        hostField.setRequired(true);
+        hostField.setPlaceholder("e.g., 192.168.1.100 or Home-PC");
+
+        progIdField.setRequired(true);
+        progIdField.setPlaceholder("e.g., OPC.SimaticNET or {CAE8D0E1-...}");
+
+        domainField.setPlaceholder("e.g., WORKGROUP or leave empty for local");
+
+        readModeBox.setItems(ReadMode.values());
+        readModeBox.setItemLabelGenerator(Enum::name);
+
+        refreshPeriodField.setMin(100);
+        refreshPeriodField.setStep(100);
+
+        reconnectIntervalField.setMin(1000);
+        reconnectIntervalField.setStep(1000);
+
+        descriptionArea.setMaxLength(500);
+    }
+
+    private void configureBinder() {
+        binder.forField(nameField)
+                .withValidator(new StringLengthValidator("Name must be 1-255 characters", 1, 255))
+                .bind(OpcDaConnection::getName, OpcDaConnection::setName);
+
+        binder.forField(hostField)
+                .withValidator(new StringLengthValidator("Hostname is required", 1, 255))
+                .bind(OpcDaConnection::getHost, OpcDaConnection::setHost);
+
+        binder.forField(progIdField)
+                .withValidator(new StringLengthValidator("ProgID/CLSID is required", 1, 255))
+                .bind(OpcDaConnection::getProgIdOrClsid, OpcDaConnection::setProgIdOrClsid);
+
+        binder.bind(domainField, OpcDaConnection::getDomain, OpcDaConnection::setDomain);
+        binder.bind(usernameField, OpcDaConnection::getUsername, OpcDaConnection::setUsername);
+        binder.bind(passwordField, OpcDaConnection::getPasswordEncrypted, OpcDaConnection::setPasswordEncrypted);
+        binder.bind(readModeBox, OpcDaConnection::getDefaultReadMode, OpcDaConnection::setDefaultReadMode);
+        binder.bind(refreshPeriodField, OpcDaConnection::getDefaultRefreshPeriodMs, OpcDaConnection::setDefaultRefreshPeriodMs);
+        binder.bind(reconnectIntervalField, OpcDaConnection::getReconnectIntervalMs, OpcDaConnection::setReconnectIntervalMs);
+        binder.bind(enabledCheckbox, OpcDaConnection::getEnabled, OpcDaConnection::setEnabled);
+        binder.bind(descriptionArea, OpcDaConnection::getDescription, OpcDaConnection::setDescription);
+    }
+
+    private void buildLayout() {
+        VerticalLayout layout = new VerticalLayout();
+        layout.setPadding(false);
+        layout.setSpacing(true);
+
+        // Строка 1: Имя и Хост
+        HorizontalLayout row1 = new HorizontalLayout(nameField, hostField);
+        row1.setWidthFull();
+        row1.setFlexGrow(1, nameField, hostField);
+
+        // Строка 2: ProgID / CLSID (на всю ширину)
+        progIdField.setWidthFull();
+
+        // Строка 3: Домен, Пользователь, Пароль
+        HorizontalLayout row2 = new HorizontalLayout(domainField, usernameField, passwordField);
+        row2.setWidthFull();
+        row2.setFlexGrow(1, domainField, usernameField, passwordField);
+
+        // Строка 4: Режим, Интервалы
+        HorizontalLayout row3 = new HorizontalLayout(readModeBox, refreshPeriodField, reconnectIntervalField);
+        row3.setWidthFull();
+        row3.setFlexGrow(1, readModeBox, refreshPeriodField, reconnectIntervalField);
+
+        // Строка 5: Enabled и Описание
+        enabledCheckbox.setWidthFull();
+        descriptionArea.setWidthFull();
+        descriptionArea.setMinHeight("80px");
+
+        layout.add(row1, progIdField, row2, row3, enabledCheckbox, descriptionArea);
+
+        // Кнопки
+        Button saveButton = new Button("Save", e -> save());
+        saveButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+
+        Button cancelButton = new Button("Cancel", e -> close());
+        cancelButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        Button testButton = new Button("Test Connection", e -> testConnection());
+        testButton.addThemeVariants(ButtonVariant.LUMO_CONTRAST);
+
+        HorizontalLayout buttons = new HorizontalLayout(testButton, cancelButton, saveButton);
+        buttons.setWidthFull();
+        buttons.setJustifyContentMode(FlexComponent.JustifyContentMode.BETWEEN);
+        buttons.expand(saveButton);
+
+        layout.add(buttons);
+        add(layout);
+    }
+
+    public void edit(OpcDaConnection connection) {
+        if (connection == null) {
+            currentConnection = new OpcDaConnection();
+            currentConnection.setDefaultReadMode(ReadMode.ASYNC);
+            currentConnection.setDefaultRefreshPeriodMs(1000);
+            currentConnection.setReconnectIntervalMs(5000);
+            currentConnection.setEnabled(true);
+            currentConnection.setDomain(""); // Явная инициализация
+        } else {
+            currentConnection = connection;
+        }
+
+        binder.setBean(currentConnection);
+        setHeaderTitle(connection == null ? "Add Connection" : "Edit Connection");
+        open();
+    }
+
+    private void save() {
+        if (binder.validate().isOk()) {
+            if (currentConnection.getId() == null && connectionService.existsByName(currentConnection.getName())) {
+                Notification.show("Connection name must be unique", 3000, Notification.Position.MIDDLE);
+                return;
+            }
+
+            connectionService.save(currentConnection);
+            onSaveCallback.run();
+            close();
+            Notification.show("Connection saved successfully", 2000, Notification.Position.BOTTOM_END);
+        } else {
+            Notification.show("Please fix validation errors", 2000, Notification.Position.MIDDLE);
+        }
+    }
+
+    private void testConnection() {
+        if (binder.validate().isOk()) {
+            // Принудительно сохраняем значения из формы в объект перед тестом
+            binder.writeBeanIfValid(currentConnection);
+            String result = connectionService.testConnection(currentConnection);
+            Notification.show(result, 4000, Notification.Position.MIDDLE);
+        } else {
+            Notification.show("Please fill required fields before testing", 2000, Notification.Position.MIDDLE);
+        }
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaClient;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.ConnectionService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.confirmdialog.ConfirmDialog;
+import com.vaadin.flow.component.contextmenu.MenuItem;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.grid.contextmenu.GridContextMenu;
+import com.vaadin.flow.component.grid.contextmenu.GridMenuItem;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Hr;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+
+@Slf4j
+@PageTitle("OPC DA Connections")
+@Route(value = "/connections", layout = MainLayout.class)
+@PermitAll
+public class ConnectionsView extends VerticalLayout {
+
+    private final ConnectionService connectionService;
+    private final Grid<OpcDaConnection> grid = new Grid<>();
+    private final ConnectionsDialog dialog;
+
+    public ConnectionsView(ConnectionService connectionService) {
+        this.connectionService = connectionService;
+        this.dialog = new ConnectionsDialog(connectionService, this::refreshGrid);
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setWidthFull();
+
+        createHeader();
+        createGrid();
+        createContextMenu();
+
+        refreshGrid();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("OPC DA Connections");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+
+        Button addButton = new Button("Add Connection", new Icon(VaadinIcon.PLUS_CIRCLE));
+        addButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addButton.addClickListener(e -> dialog.edit(null));
+
+        Button refreshButton = new Button("Refresh", new Icon(VaadinIcon.REFRESH));
+        refreshButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        refreshButton.addClickListener(e -> refreshGrid());
+
+        HorizontalLayout header = new HorizontalLayout(title, addButton, refreshButton);
+        header.setWidthFull();
+        header.setAlignItems(FlexComponent.Alignment.CENTER);
+        header.expand(title);
+
+        add(header);
+    }
+
+    private void createGrid() {
+        grid.setWidthFull();
+        grid.setHeight("500px");
+        grid.setSelectionMode(Grid.SelectionMode.SINGLE);
+
+        // Колонка имени
+        grid.addColumn(OpcDaConnection::getName)
+                .setHeader("Name")
+                .setFlexGrow(2)
+                .setSortable(true);
+
+        // Колонка хоста
+        grid.addColumn(OpcDaConnection::getHost)
+                .setHeader("Host")
+                .setFlexGrow(1);
+
+        // Колонка ProgID
+        grid.addColumn(OpcDaConnection::getProgIdOrClsid)
+                .setHeader("ProgID / CLSID")
+                .setFlexGrow(1);
+
+        // Колонка статуса с цветовой индикацией
+        grid.addComponentColumn(this::createStatusBadge)
+                .setHeader("Status")
+                .setFlexGrow(1);
+
+        // Колонка режима чтения
+        grid.addColumn(conn -> conn.getDefaultReadMode().name())
+                .setHeader("Mode")
+                .setFlexGrow(1);
+
+        // Колонка интервала опроса
+        grid.addColumn(conn -> conn.getDefaultRefreshPeriodMs() + " ms")
+                .setHeader("Polling")
+                .setFlexGrow(1);
+
+        // Колонка количества ошибок
+        grid.addColumn(conn -> {
+                    int errors = connectionService.getErrorCount(conn.getId());
+                    return errors > 0 ? String.valueOf(errors) : "-";
+                })
+                .setHeader("Errors")
+                .setFlexGrow(1);
+
+        // Колонка enabled
+        grid.addComponentColumn(conn -> {
+                    Span badge = new Span(conn.getEnabled() ? "YES" : "NO");
+                    badge.addClassNames(
+                            LumoUtility.Padding.Horizontal.SMALL,
+                            LumoUtility.Padding.Vertical.XSMALL,
+                            LumoUtility.BorderRadius.MEDIUM,
+                            LumoUtility.FontSize.XSMALL,
+                            LumoUtility.FontWeight.BOLD
+                    );
+                    if (conn.getEnabled()) {
+                        badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-success-color)");
+                    } else {
+                        badge.getStyle().set("background-color", "var(--lumo-error-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-error-color)");
+                    }
+                    return badge;
+                })
+                .setHeader("Enabled")
+                .setFlexGrow(1);
+
+        add(grid);
+    }
+
+    private void createContextMenu() {
+        GridContextMenu<OpcDaConnection> contextMenu = grid.addContextMenu();
+
+        GridMenuItem<OpcDaConnection> editItem = contextMenu.addItem("Edit");
+        editItem.addMenuItemClickListener(opcDaConnectionGridContextMenuItemClickEvent ->
+                opcDaConnectionGridContextMenuItemClickEvent.getItem()
+                        .ifPresent(this::editConnection));
+
+        GridMenuItem<OpcDaConnection> testItem = contextMenu.addItem("Test Connection");
+        testItem.addMenuItemClickListener(
+                e ->
+                        e.getItem().ifPresent(this::testConnection));
+
+        GridMenuItem<OpcDaConnection> reconnectItem = contextMenu.addItem("Reconnect");
+        reconnectItem.addMenuItemClickListener(e -> e.getItem().ifPresent(this::reconnect));
+        contextMenu.addComponent(new Hr());
+
+        GridMenuItem<OpcDaConnection> deleteItem = contextMenu.addItem("Delete");
+        deleteItem.addMenuItemClickListener(
+                e -> e.getItem()
+                        .ifPresent(this::confirmDelete));
+    }
+
+    private Span createStatusBadge(OpcDaConnection connection) {
+        ConnectionState state = connectionService.getStatus(connection.getId());
+        Span badge = new Span(state.name());
+        badge.addClassNames(
+                LumoUtility.Padding.Horizontal.SMALL,
+                LumoUtility.Padding.Vertical.XSMALL,
+                LumoUtility.BorderRadius.MEDIUM,
+                LumoUtility.FontSize.XSMALL,
+                LumoUtility.FontWeight.BOLD
+        );
+
+        switch (state) {
+            case CONNECTED:
+                badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+                badge.getStyle().set("color", "var(--lumo-success-color)");
+                break;
+            case CONNECTING:
+            case RECONNECTING:
+                badge.getStyle().set("background-color", "var(--lumo-warning-contrast-color)");
+                badge.getStyle().set("color", "var(--lumo-warning-color)");
+                break;
+            case FAILED:
+            case DISCONNECTED:
+                badge.getStyle().set("background-color", "var(--lumo-error-contrast-color)");
+                badge.getStyle().set("color", "var(--lumo-error-color)");
+                break;
+        }
+
+        return badge;
+    }
+
+    private void editConnection(OpcDaConnection connection) {
+        dialog.edit(connection);
+    }
+
+    public String testConnection(OpcDaConnection connection) {
+        OpcDaClient testClient = new OpcDaClient(connection);
+        try {
+            testClient.connect();
+            testClient.disconnect();
+            return "Подключение успешно установлено";
+        } catch (Exception e) {
+            log.error("Test connection failed for: {}", connection.getName(), e);
+
+            // Дружелюбное сообщение об ошибке на основе стека j-Interop
+            String errorMsg = e.getMessage();
+            if (errorMsg != null && (errorMsg.contains("0xC0000001") || errorMsg.contains("SmbException") || errorMsg.contains("Connection reset"))) {
+                return "Ошибка DCOM/SMB: Проверьте, что указан IP-адрес (не localhost), верны логин/пароль Windows, и в dcomcnfg настроены права 'Launch and Activation Permissions'.";
+            } else if (errorMsg != null && errorMsg.contains("Class not registered")) {
+                return "Ошибка: ProgID или CLSID не найден в реестре Windows. Проверьте правильность написания.";
+            }
+
+            return "Ошибка подключения: " + e.getMessage();
+        }
+    }
+
+    private void reconnect(OpcDaConnection connection) {
+        connectionService.reconnect(connection.getId());
+        Notification.show("Reconnecting to " + connection.getName(), 2000, Notification.Position.BOTTOM_END);
+        // Обновляем статус через секунду
+        getUI().ifPresent(ui -> ui.accessLater(this::refreshGrid, null));
+    }
+
+    private void confirmDelete(OpcDaConnection connection) {
+        ConfirmDialog dialog = new ConfirmDialog();
+        dialog.setHeader("Delete Connection");
+        dialog.setText("Are you sure you want to delete connection '" + connection.getName() + "'?");
+        dialog.setConfirmText("Delete");
+        dialog.setConfirmButtonTheme("error primary");
+        dialog.addConfirmListener(e -> {
+            connectionService.delete(connection.getId());
+            refreshGrid();
+            Notification.show("Connection deleted", 2000, Notification.Position.BOTTOM_END);
+        });
+        dialog.open();
+    }
+
+    private void refreshGrid() {
+        List<OpcDaConnection> connections = connectionService.findAll();
+        grid.setItems(connections);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.DashboardService;
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+
+@PageTitle("Dashboard")
+@Route(value = "", layout = MainLayout.class) // Пустая строка "" означает корень "/"
+@PermitAll
+public class DashboardView extends VerticalLayout {
+
+    private final DashboardService dashboardService;
+
+    private final Span opcUaStatus = new Span();
+    private final Span totalTags = new Span();
+    private final Span goodTags = new Span();
+    private final Span badTags = new Span();
+    private final Grid<DashboardService.ConnectionStatusDto> connectionGrid = new Grid<>();
+
+    public DashboardView(DashboardService dashboardService) {
+        this.dashboardService = dashboardService;
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setWidthFull();
+
+        createOpcUaStatusCard();
+        createTagStatsCard();
+        createConnectionsGrid();
+
+        refreshData();
+    }
+
+    private void createOpcUaStatusCard() {
+        H2 title = new H2("OPC UA Server");
+        title.addClassNames(LumoUtility.Margin.Bottom.SMALL);
+
+        opcUaStatus.addClassNames(LumoUtility.FontSize.XLARGE, LumoUtility.FontWeight.BOLD);
+
+        VerticalLayout card = new VerticalLayout(title, opcUaStatus);
+        card.addClassNames(LumoUtility.Background.CONTRAST_5, LumoUtility.Padding.MEDIUM, LumoUtility.BorderRadius.MEDIUM);
+        card.setWidthFull();
+        add(card);
+    }
+
+    private void createTagStatsCard() {
+        H2 title = new H2("Tag Statistics");
+        title.addClassNames(LumoUtility.Margin.Bottom.SMALL);
+
+        HorizontalLayout stats = new HorizontalLayout();
+        stats.setSpacing(true);
+
+        totalTags.setText("Total: 0");
+        goodTags.setText("Good: 0");
+        goodTags.addClassNames("status-good");
+        badTags.setText("Bad: 0");
+        badTags.addClassNames("status-bad");
+
+        stats.add(totalTags, goodTags, badTags);
+
+        VerticalLayout card = new VerticalLayout(title, stats);
+        card.addClassNames(LumoUtility.Background.CONTRAST_5, LumoUtility.Padding.MEDIUM, LumoUtility.BorderRadius.MEDIUM);
+        card.setWidthFull();
+        add(card);
+    }
+
+    private void createConnectionsGrid() {
+        H2 title = new H2("OPC DA Connections");
+        title.addClassNames(LumoUtility.Margin.Bottom.SMALL);
+
+        connectionGrid.addColumn(DashboardService.ConnectionStatusDto::name).setHeader("Name");
+        connectionGrid.addColumn(DashboardService.ConnectionStatusDto::host).setHeader("Host");
+        connectionGrid.addColumn(DashboardService.ConnectionStatusDto::state).setHeader("State");
+        connectionGrid.addColumn(DashboardService.ConnectionStatusDto::errorCount).setHeader("Errors");
+
+        connectionGrid.setWidthFull();
+        connectionGrid.setHeight("200px");
+
+        add(title, connectionGrid);
+    }
+
+    @Override
+    protected void onAttach(AttachEvent attachEvent) {
+        super.onAttach(attachEvent);
+        // Можно добавить UI.poll(1000, e -> refreshData()) для автообновления,
+        // но пока сделаем ручное обновление при входе на вкладку
+    }
+
+    public void refreshData() {
+        // OPC UA Status
+        boolean uaRunning = dashboardService.isOpcUaServerRunning();
+        opcUaStatus.setText(uaRunning ? "RUNNING (Port " + dashboardService.getOpcUaServerPort() + ")" : "STOPPED");
+        opcUaStatus.getStyle().set("color", uaRunning ? "var(--lumo-success-color)" : "var(--lumo-error-color)");
+
+        // Tag Stats
+        DashboardService.TagStatsDto stats = dashboardService.getTagStats();
+        totalTags.setText("Total: " + stats.total());
+        goodTags.setText("Good: " + stats.good());
+        badTags.setText("Bad: " + stats.bad());
+
+        // Connections
+        connectionGrid.setItems(dashboardService.getConnectionStatuses());
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.vaadin.flow.component.html.H1;
+import com.vaadin.flow.component.login.LoginForm;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.BeforeEnterEvent;
+import com.vaadin.flow.router.BeforeEnterObserver;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.server.auth.AnonymousAllowed;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+
+@PageTitle("Login")
+@Route(value = "login")
+@AnonymousAllowed // Обязательно! Иначе Vaadin заблокирует саму страницу логина
+public class LoginView extends VerticalLayout implements BeforeEnterObserver {
+
+    private final LoginForm loginForm = new LoginForm();
+
+    public LoginView() {
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setAlignItems(Alignment.CENTER);
+        setSizeFull();
+        setJustifyContentMode(JustifyContentMode.CENTER);
+
+        H1 title = new H1("OPC DA-UA Proxy");
+        title.addClassNames(LumoUtility.FontSize.XLARGE, LumoUtility.Margin.Bottom.MEDIUM);
+
+        // Отправляем форму на стандартный endpoint Spring Security
+        loginForm.setAction("login");
+
+        add(title, loginForm);
+    }
+
+    @Override
+    public void beforeEnter(BeforeEnterEvent event) {
+        // Если в URL есть ?error, показываем сообщение об ошибке в форме
+        if (event.getLocation()
+                .getQueryParameters()
+                .getParameters()
+                .containsKey("error")) {
+            loginForm.setError(true);
+        }
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.DataType;
+import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.combobox.ComboBox;
+import com.vaadin.flow.component.dialog.Dialog;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.textfield.IntegerField;
+import com.vaadin.flow.component.textfield.TextArea;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.data.binder.Binder;
+import com.vaadin.flow.data.validator.StringLengthValidator;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+
+@Slf4j
+public class TagDialog extends Dialog {
+
+    private final TagService tagService;
+    private final OpcDaConnectionRepository connectionRepository;
+    private final Runnable onSaveCallback;
+
+    private final TextField nameField = new TextField("Tag Name");
+    private final ComboBox<SourceType> sourceTypeBox = new ComboBox<>("Source Type");
+    private final ComboBox<OpcDaConnection> connectionBox = new ComboBox<>("OPC DA Connection");
+    private final TextField sourceItemIdField = new TextField("Item ID / Tag Path");
+    private final ComboBox<DataType> dataTypeBox = new ComboBox<>("Data Type");
+    private final ComboBox<ReadMode> readModeBox = new ComboBox<>("Read Mode");
+    private final IntegerField refreshPeriodField = new IntegerField("Refresh Period (ms)");
+    private final Checkbox enabledCheckbox = new Checkbox("Enabled");
+    private final TextArea descriptionArea = new TextArea("Description");
+
+    private final Binder<Tag> binder = new Binder<>(Tag.class);
+    private Tag currentTag;
+
+    public TagDialog(TagService tagService, OpcDaConnectionRepository connectionRepository, Runnable onSaveCallback) {
+        this.tagService = tagService;
+        this.connectionRepository = connectionRepository;
+        this.onSaveCallback = onSaveCallback;
+
+        setHeaderTitle("OPC Tag Configuration");
+        setCloseOnOutsideClick(false);
+        setWidth("600px");
+
+        configureFields();
+        configureBinder();
+        buildLayout();
+    }
+
+    private void configureFields() {
+        nameField.setRequired(true);
+        nameField.setPlaceholder("e.g., Tank1_Level");
+
+        sourceTypeBox.setItems(SourceType.values());
+        sourceTypeBox.setItemLabelGenerator(Enum::name);
+        sourceTypeBox.setRequired(true);
+
+        connectionBox.setItems(connectionRepository.findAll());
+        connectionBox.setItemLabelGenerator(OpcDaConnection::getName);
+
+        sourceItemIdField.setPlaceholder("e.g., Channel1.Device1.Tag1");
+
+        dataTypeBox.setItems(DataType.values());
+        dataTypeBox.setItemLabelGenerator(Enum::name);
+        dataTypeBox.setRequired(true);
+
+        readModeBox.setItems(ReadMode.values());
+        readModeBox.setItemLabelGenerator(Enum::name);
+
+        refreshPeriodField.setMin(100);
+        refreshPeriodField.setStep(100);
+        refreshPeriodField.setRequired(true);
+
+        descriptionArea.setMaxLength(500);
+
+        // Логика показа/скрытия полей OPC DA
+        sourceTypeBox.addValueChangeListener(e -> {
+            boolean isDa = e.getValue() == SourceType.DA;
+            connectionBox.setVisible(isDa);
+            sourceItemIdField.setVisible(isDa);
+            readModeBox.setVisible(isDa);
+            refreshPeriodField.setVisible(isDa);
+        });
+    }
+
+    private void configureBinder() {
+        binder.forField(nameField)
+                .withValidator(new StringLengthValidator("Name must be 1-255 characters", 1, 255))
+                .bind(Tag::getName, Tag::setName);
+
+        binder.bind(sourceTypeBox, Tag::getSourceType, Tag::setSourceType);
+        binder.bind(connectionBox, Tag::getConnection, Tag::setConnection);
+        binder.bind(sourceItemIdField, Tag::getSourceItemId, Tag::setSourceItemId);
+        binder.bind(dataTypeBox, Tag::getDataType, Tag::setDataType);
+        binder.bind(readModeBox, Tag::getReadMode, Tag::setReadMode);
+        binder.bind(refreshPeriodField, Tag::getRefreshPeriodMs, Tag::setRefreshPeriodMs);
+        binder.bind(enabledCheckbox, Tag::getEnabled, Tag::setEnabled);
+        binder.bind(descriptionArea, Tag::getDescription, Tag::setDescription);
+    }
+
+    private void buildLayout() {
+        VerticalLayout layout = new VerticalLayout();
+        layout.setPadding(false);
+        layout.setSpacing(true);
+
+        HorizontalLayout row1 = new HorizontalLayout(nameField, sourceTypeBox);
+        row1.setWidthFull();
+        row1.setFlexGrow(1, nameField, sourceTypeBox);
+
+        HorizontalLayout row2 = new HorizontalLayout(connectionBox, sourceItemIdField);
+        row2.setWidthFull();
+        row2.setFlexGrow(1, connectionBox, sourceItemIdField);
+
+        HorizontalLayout row3 = new HorizontalLayout(dataTypeBox, readModeBox, refreshPeriodField);
+        row3.setWidthFull();
+        row3.setFlexGrow(1, dataTypeBox, readModeBox, refreshPeriodField);
+
+        layout.add(row1, row2, row3, enabledCheckbox, descriptionArea);
+
+        Button saveButton = new Button("Save", e -> save());
+        saveButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+
+        Button cancelButton = new Button("Cancel", e -> close());
+        cancelButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        HorizontalLayout buttons = new HorizontalLayout(cancelButton, saveButton);
+        buttons.setWidthFull();
+        buttons.setJustifyContentMode(FlexComponent.JustifyContentMode.END);
+
+        layout.add(buttons);
+        add(layout);
+    }
+
+    public void edit(Tag tag) {
+        if (tag == null) {
+            currentTag = new Tag();
+            currentTag.setSourceType(SourceType.DA);
+            currentTag.setDataType(DataType.FLOAT);
+            currentTag.setReadMode(ReadMode.ASYNC);
+            currentTag.setRefreshPeriodMs(1000);
+            currentTag.setEnabled(true);
+        } else {
+            currentTag = tag;
+        }
+        binder.setBean(currentTag);
+        setHeaderTitle(tag == null ? "Add Tag" : "Edit Tag");
+        open();
+    }
+
+    private void save() {
+        if (binder.validate().isOk()) {
+            if (currentTag.getId() == null && tagService.existsByName(currentTag.getName())) {
+                Notification.show("Tag name must be unique", 3000, Notification.Position.MIDDLE);
+                return;
+            }
+            if (currentTag.getSourceType() == SourceType.DA && currentTag.getConnection() == null) {
+                Notification.show("Please select an OPC DA Connection", 3000, Notification.Position.MIDDLE);
+                return;
+            }
+
+            tagService.save(currentTag);
+            onSaveCallback.run();
+            close();
+            Notification.show("Tag saved successfully", 2000, Notification.Position.BOTTOM_END);
+        } else {
+            Notification.show("Please fix validation errors", 2000, Notification.Position.MIDDLE);
+        }
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.DetachEvent;
+import com.vaadin.flow.component.UI;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.confirmdialog.ConfirmDialog;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.shared.Registration;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@PageTitle("Tags Management")
+@Route(value = "tags", layout = com.opcproxy.ui.MainLayout.class)
+@PermitAll
+//@Component // <-- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: регистрирует класс как Spring Bean
+public class TagsView extends VerticalLayout {
+
+    private final TagService tagService;
+    private final TagRegistry tagRegistry;
+    private final OpcDaConnectionRepository connectionRepository;
+
+    private final Grid<Tag> grid = new Grid<>();
+    private final TagDialog dialog;
+
+    // Ссылки на Span со значением по id тега — для живого обновления
+    private final Map<Long, Span> valueSpans = new ConcurrentHashMap<>();
+    private Registration pollRegistration;
+
+    // Конструктор теперь управляется Spring через @RequiredArgsConstructor,
+    // но мы можем явно его объявить для инициализации dialog, если нужно,
+    // или инициализировать dialog прямо в поле.
+    public TagsView(TagService tagService, TagRegistry tagRegistry, OpcDaConnectionRepository connectionRepository) {
+        this.tagService = tagService;
+        this.tagRegistry = tagRegistry;
+        this.connectionRepository = connectionRepository;
+
+        // Инициализируем диалог
+        this.dialog = new TagDialog(tagService, connectionRepository, this::refreshGrid);
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setWidthFull();
+
+        createHeader();
+        createGrid();
+        createContextMenu();
+        refreshGrid();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("Tags Configuration");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+
+        Button addButton = new Button("Add Tag", new Icon(VaadinIcon.PLUS_CIRCLE));
+        addButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addButton.addClickListener(e -> dialog.edit(null));
+
+        Button refreshButton = new Button("Refresh", new Icon(VaadinIcon.REFRESH));
+        refreshButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        refreshButton.addClickListener(e -> refreshGrid());
+
+        HorizontalLayout header = new HorizontalLayout(title, addButton, refreshButton);
+        header.setWidthFull();
+        header.setAlignItems(FlexComponent.Alignment.CENTER);
+        header.expand(title);
+        add(header);
+    }
+
+    private void createGrid() {
+        grid.setWidthFull();
+        grid.setHeight("600px");
+        grid.setSelectionMode(Grid.SelectionMode.SINGLE);
+
+        grid.addColumn(Tag::getName).setHeader("Name")
+                .setFlexGrow(2)
+                .setSortable(true);
+        grid.addColumn(tag -> tag.getSourceType().name())
+                .setHeader("Type").setFlexGrow(1);
+        grid.addColumn(tag -> tag.getConnection() != null ? tag.getConnection()
+                .getName() : "-").setHeader("Connection").setFlexGrow(1);
+        grid.addColumn(Tag::getSourceItemId).setHeader("Item ID").setFlexGrow(2);
+
+        // Колонка значения — Span сохраняем в map и обновляем по poll
+        grid.addComponentColumn(tag -> {
+            Span valueSpan = new Span();
+            valueSpan.addClassName(LumoUtility.FontSize.SMALL);
+            valueSpans.put(tag.getId(), valueSpan);
+            applyValue(tag.getId());
+            return valueSpan;
+        }).setHeader("Current Value").setFlexGrow(1);
+
+        grid.addComponentColumn(this::createQualityBadge).setHeader("Quality").setFlexGrow(1);
+        grid.addColumn(tag -> tag.getRefreshPeriodMs() + " ms").setHeader("Polling").setFlexGrow(1);
+
+        grid.addComponentColumn(tag -> {
+            Span badge = new Span(tag.getEnabled() ? "YES" : "NO");
+            badge.addClassNames(LumoUtility.Padding.Horizontal.SMALL, LumoUtility.Padding.Vertical.XSMALL, LumoUtility.BorderRadius.MEDIUM, LumoUtility.FontSize.XSMALL, LumoUtility.FontWeight.BOLD);
+            if (tag.getEnabled()) {
+                badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+                badge.getStyle().set("color", "var(--lumo-success-color)");
+            } else {
+                badge.getStyle().set("background-color", "var(--lumo-error-contrast-color)");
+                badge.getStyle().set("color", "var(--lumo-error-color)");
+            }
+            return badge;
+        }).setHeader("Enabled").setFlexGrow(1);
+        addActionColumn(); // <-- кнопки Edit/Delete (см. раздел 3)
+        add(grid);
+    }
+    /** Обновляет Span одного тега данными из реестра. */
+    private void applyValue(Long tagId) {
+        Span span = valueSpans.get(tagId);
+        if (span == null) return;
+
+        Object value = tagRegistry.getTagValue(tagId)
+                .map(TagRegistry.TagValue::getValue).orElse(null);
+        String quality = tagRegistry.getTagValue(tagId)
+                .map(TagRegistry.TagValue::getQuality).orElse("Unknown");
+
+        String newText = value != null ? String.valueOf(value) : "—";
+        String newColor = quality.startsWith("Good") ? "var(--lumo-success-color)"
+                : quality.startsWith("Uncertain") ? "var(--lumo-warning-color)"
+                : "var(--lumo-error-color)";
+
+        // Обновляем DOM только при изменении — экономим трафик Push
+        if (!newText.equals(span.getText())
+                || !newColor.equals(span.getElement().getStyle().get("color"))) {
+            getUI().ifPresent(ui -> ui.access(() -> {
+                span.setText(newText);
+                span.getStyle().set("color", newColor);
+            }));
+        }
+    }
+
+    @Override
+    protected void onAttach(AttachEvent event) {
+        super.onAttach(event);
+        UI ui = event.getUI();
+        ui.setPollInterval(1000);                 // браузер пингует сервер раз в секунду
+        pollRegistration = ui.addPollListener(e ->
+                valueSpans.keySet().forEach(this::applyValue));
+    }
+
+    @Override
+    protected void onDetach(DetachEvent event) {
+        if (pollRegistration != null) {
+            pollRegistration.remove();
+            pollRegistration = null;
+        }
+        event.getUI().setPollInterval(-1);
+        super.onDetach(event);
+    }
+
+
+    private void createContextMenu() {
+        grid.addContextMenu().addItem("Edit", e -> e.getItem().ifPresent(dialog::edit));
+        grid.addContextMenu().addItem("Delete", e -> e.getItem().ifPresent(this::confirmDelete));
+    }
+    private void addActionColumn() {
+        grid.addComponentColumn(tag -> {
+            Button editBtn = new Button(new Icon(VaadinIcon.EDIT));
+            editBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+            editBtn.setTooltipText("Edit");
+            editBtn.addClickListener(e -> editTag(tag.getId()));
+
+            Button deleteBtn = new Button(new Icon(VaadinIcon.TRASH));
+            deleteBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY,
+                    ButtonVariant.LUMO_ERROR);
+            deleteBtn.setTooltipText("Delete");
+            deleteBtn.addClickListener(e -> confirmDelete(tag));
+
+            HorizontalLayout actions = new HorizontalLayout(editBtn, deleteBtn);
+            actions.setSpacing(false);
+            actions.setJustifyContentMode(FlexComponent.JustifyContentMode.CENTER);
+            return actions;
+        }).setHeader("Actions").setFlexGrow(0).setWidth("110px");
+    }
+
+    /**
+     * Редактирование по id: перечитываем сущность из БД,
+     * чтобы не редактировать устаревший detached-объект из Grid
+     * (иначе возможен OptimisticLockException из-за @Version).
+     */
+    private void editTag(Long tagId) {
+        tagService.findById(tagId).ifPresentOrElse(
+                dialog::edit,
+                () -> Notification.show("Tag not found", 3000, Notification.Position.MIDDLE)
+        );
+    }
+    private Span createQualityBadge(Tag tag) {
+        String quality = tagRegistry.getTagValue(tag.getId()).map(com.opcproxy.tags.TagRegistry.TagValue::getQuality).orElse("Unknown");
+
+        Span badge = new Span(quality);
+        badge.addClassNames(LumoUtility.Padding.Horizontal.SMALL, LumoUtility.Padding.Vertical.XSMALL, LumoUtility.BorderRadius.MEDIUM, LumoUtility.FontSize.XSMALL, LumoUtility.FontWeight.BOLD);
+
+        if (quality.startsWith("Good")) {
+            badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+            badge.getStyle().set("color", "var(--lumo-success-color)");
+        } else if (quality.startsWith("Uncertain")) {
+            badge.getStyle().set("background-color", "var(--lumo-warning-contrast-color)");
+            badge.getStyle().set("color", "var(--lumo-warning-color)");
+        } else {
+            badge.getStyle().set("background-color", "var(--lumo-error-contrast-color)");
+            badge.getStyle().set("color", "var(--lumo-error-color)");
+        }
+        return badge;
+    }
+
+    private void confirmDelete(Tag tag) {
+        ConfirmDialog dialog = new ConfirmDialog();
+        dialog.setHeader("Delete Tag");
+        dialog.setText("Are you sure you want to delete tag '" + tag.getName() + "'?");
+        dialog.setConfirmText("Delete");
+        dialog.setConfirmButtonTheme("error primary");
+        dialog.addConfirmListener(e -> {
+            tagService.delete(tag.getId());
+            refreshGrid();
+            Notification.show("Tag deleted", 2000, Notification.Position.BOTTOM_END);
+        });
+        dialog.open();
+    }
+
+    private void refreshGrid() {
+        List<Tag> tags = tagService.findAll();
+        valueSpans.clear();          // старые Span больше не актуальны
+        grid.setItems(tags);
+    }
+}
+============================================================
+
+/**j-Interop (Pure Java implementation of DCOM protocol)
+ * Copyright (C) 2006  Vikram Roopchand
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 3.0 of the License, or (at your option) any later version.
+ *
+ * Though a sincere effort has been made to deliver a professional,
+ * quality product,the library itself is distributed WITHOUT ANY WARRANTY;
+ * See the GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110, USA
+ */
+
+package org.jinterop.dcom.core;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Properties;
+
+import org.jinterop.dcom.common.JIDefaultAuthInfoImpl;
+import org.jinterop.dcom.common.JIErrorCodes;
+import org.jinterop.dcom.common.JIException;
+import org.jinterop.dcom.common.JIRuntimeException;
+import org.jinterop.dcom.common.JISystem;
+import org.jinterop.dcom.impls.JIObjectFactory;
+import org.jinterop.dcom.impls.automation.IJIDispatch;
+import org.jinterop.dcom.transport.JIComEndpoint;
+import org.jinterop.dcom.transport.JIComTransportFactory;
+import org.jinterop.winreg.IJIWinReg;
+import org.jinterop.winreg.JIPolicyHandle;
+import org.jinterop.winreg.JIWinRegFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import rpc.Endpoint;
+import rpc.FaultException;
+import rpc.Stub;
+
+/**
+ * Startup class representing a COM Server.
+ * <p>
+ * Sample Usage :- <br>
+ * <code>
+ *
+ *  {@link JISession} session = JISession.createSession("DOMAIN","USERNAME","PASSWORD"); <br>
+ * 	JIComServer excelServer = new JIComServer(JIProgId.valueOf("Excel.Application"),address,session); <br>
+ *  IJIComObject comObject = excelServer.createInstance(); <br>
+ *  //Obtaining the IJIDispatch (if supported) <br>
+ *  {@link IJIDispatch} dispatch = (IJIDispatch){@link JIObjectFactory}.narrowObject(comObject.queryInterface(IJIDispatch.IID)); <br>
+ *  </code>
+ * <p>
+ * Each instance of this class is associated with a single session only.
+ *
+ * @since 1.0
+ */
+public final class JIComServer extends Stub
+{
+
+    private final static Logger logger = LoggerFactory.getLogger ( JIComServer.class );
+
+    private static Properties defaults = new Properties ();
+    static
+    {
+
+        defaults.put ( "rpc.ntlm.lanManagerKey", "false" );
+        defaults.put ( "rpc.ntlm.sign", "false" );
+        defaults.put ( "rpc.ntlm.seal", "false" );
+        defaults.put ( "rpc.ntlm.keyExchange", "false" );
+        defaults.put ( "rpc.ntlm.sso", "false" );
+        defaults.put ( "rpc.connectionContext", "rpc.security.ntlm.NtlmConnectionContext" );
+        defaults.put ( "rpc.socketTimeout", 0);
+        //		rpc.connectionContext = rpc.security.ntlm.NtlmConnectionContext
+        //		rpc.ntlm.sign = false
+        //		rpc.ntlm.seal = false
+        //		rpc.ntlm.keyExchange = false
+
+    }
+
+    //private String address = null;
+    private JIRemActivation remoteActivation = null;
+
+    private JIOxidResolver oxidResolver = null;
+
+    private String clsid = null;
+
+    private String syntax = null;
+
+    private JISession session = null;
+
+    private boolean serverInstantiated = false;
+
+    private String remunknownIPID = null;
+
+    private final Object mutex = new Object ();
+
+    private boolean timeoutModifiedfrom0 = false;
+
+    private JIInterfacePointer interfacePtrCtor = null;
+
+    private JIComServer ()
+    {
+    }
+
+    /**
+     * <p>
+     * Instantiates a JIComServer represented by the interfacePointer param.
+     * There are cases where a COM server may hand down a reference to a
+     * different COM server(which may or may not be on the same machine) and we
+     * would like to hook in between. The <code>IJIComObject</code> interface is
+     * usable only in the context of the current JIComServer, but when the
+     * interfacePointer is of a completely different COM server, the
+     * JIObjectFactory APIs will not work. The reason is the interface pointer
+     * passed to those APIs expects to belong only to a single and same COM
+     * server (say 'A'). If by any chance, that COM server passes a reference to
+     * you of another COM server (say 'B') on a different machine, the
+     * <code>IJIComObject</code> so returned from <code>JIObjectFactory</code>
+     * APIs will result in "Method not found" Exceptions (or others) since the
+     * pointer returned via that will always place calls to 'A' instead of 'B'.
+     * Under such scenarios you must use this API. This is not a usual case and
+     * for reasons related to nature of DCOM, will be very well documented in
+     * the Developers guide of your COM server.
+     * <p>
+     * The DCOM specs refer to this as the "middleman" case. (Section 3.3.1)
+     * </p>
+     * </p>
+     *
+     * @param session
+     *            Please use a new session and not an already bounded one. The
+     *            <code>JISession.createSession(JISession)</code> can be used to
+     *            create a new session.
+     * @param interfacePointer
+     *            reference to a different COM server pointer.
+     * @param ipAddress
+     *            Can be <code>null</code>. Sometimes there are many adapters
+     *            (virtual as well) on the Target machine to which this
+     *            interface pointer belongs,
+     *            which may get sent as part of the interface pointer and
+     *            consequently this call will fail since it is a possibility
+     *            that IP is not reachable via this machine.
+     *            The developer can send in the valid IP and if found in the
+     *            interface pointer list will be used to talk to the target
+     *            machine, overriding the other IP addresses present in the
+     *            interface pointer.
+     *            If this IP is not found then the "machine name" binding will
+     *            be used. If this param is <code>null</code> then the first
+     *            binding obtained from the interface pointer is used.
+     */
+    JIComServer ( final JISession session, final JIInterfacePointer interfacePointer, final String ipAddress ) throws JIException
+    {
+        super ();
+
+        if ( interfacePointer == null || session == null )
+        {
+            throw new IllegalArgumentException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_ILLEGAL_ARGUMENTS ) );
+        }
+
+        if ( session.getStub () != null )
+        {
+            throw new JIException ( JIErrorCodes.JI_SESSION_ALREADY_ESTABLISHED );
+        }
+
+        if ( logger.isInfoEnabled () )
+        {
+            JISystem.internal_dumpMap ();
+        }
+
+        super.setTransportFactory ( JIComTransportFactory.getSingleTon () );
+        //now read the session and prepare information for the stub.
+        super.setProperties ( new Properties ( defaults ) );
+        super.getProperties ().setProperty ( "rpc.security.username", session.getUserName () );
+        super.getProperties ().setProperty ( "rpc.security.password", session.getPassword () );
+        super.getProperties ().setProperty ( "rpc.ntlm.domain", session.getDomain () );
+        super.getProperties ().setProperty ( "rpc.socketTimeout", String.valueOf(session.getGlobalSocketTimeout ()));
+        if ( session.isNTLMv2Enabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.ntlmv2", "true" );
+        }
+        if ( session.isSSOEnabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.sso", "true" );
+        }
+
+        final JIStringBinding[] addressBindings = interfacePointer.getStringBindings ().getStringBindings ();
+
+        int i = 0;
+        JIStringBinding binding = null;
+        JIStringBinding nameBinding = null;
+        final String targetAddress = ipAddress == null ? "" : ipAddress.trim ();
+
+        //		if (!targetAddress.equals(""))
+        {
+            //now we choose, otherwise the first one we get.
+            while ( i < addressBindings.length )
+            {
+                binding = addressBindings[i];
+                if ( binding.getTowerId () != 0x07 ) //this means, even though I asked for TCPIP something else was supplied, noticed this in win2k.
+                {
+                    i++;
+                    continue;
+                }
+                //get the one with IP address
+                int index = binding.getNetworkAddress ().indexOf ( "." );
+                if ( index != -1 )
+                {
+                    try
+                    {
+
+                        if ( binding.getNetworkAddress ().equalsIgnoreCase ( targetAddress ) )
+                        {
+                            nameBinding = null;
+                            break;
+                        }
+
+                        //now check for the one with port
+                        index = binding.getNetworkAddress ().indexOf ( "[" );//this contains the port
+                        if ( index != -1 && binding.getNetworkAddress ().substring ( 0, index ).equalsIgnoreCase ( targetAddress ) )
+                        {
+                            nameBinding = null;
+                            break;
+                        }
+
+                    }
+                    catch ( final NumberFormatException e )
+                    {
+
+                    }
+                }
+                else
+                {
+                    //can only come for the name, saving it incase nothing matches the target address
+                    nameBinding = binding;
+                }
+                i++;
+            }
+
+            binding = nameBinding == null ? binding : nameBinding;
+        }
+        //		else
+        //		{
+        //			//Just pick up the first one.
+        //			binding = addressBindings[0];
+        //		}
+
+        //will use this last binding .
+        //and currently only TCPIP is supported.
+        String address = binding.getNetworkAddress ();
+        if ( address.indexOf ( "[" ) == -1 )//this does not contain the port
+        {
+            final String ipAddr = JISystem.getIPForHostName ( address ); //to use the binding supplied by the user.
+            if ( ipAddr != null )
+            {
+                address = ipAddr;
+            }
+            //use 135
+            address = address + "[135]";
+        }
+        else
+        {
+            final int index = address.indexOf ( "[" );
+            final String hostname = binding.getNetworkAddress ().substring ( 0, index );
+            final String ipAddr = JISystem.getIPForHostName ( hostname ); //to use the binding supplied by the user.
+            if ( ipAddr != null )
+            {
+                address = ipAddr + address.substring ( index );
+            }
+        }
+        super.setAddress ( "ncacn_ip_tcp:" + address );
+        this.session = session;
+        this.session.setTargetServer ( getAddress ().substring ( getAddress ().indexOf ( ":" ) + 1, getAddress ().indexOf ( "[" ) ) );
+        this.oxidResolver = new JIOxidResolver ( ( (JIStdObjRef)interfacePointer.getObjectReference ( JIInterfacePointer.OBJREF_STANDARD ) ).getOxid () );
+        try
+        {
+
+            this.syntax = "99fcfec4-5260-101b-bbcb-00aa0021347a:0.0";
+            attach ();
+            //first send an AlterContext to the IID of the IOxidResolver
+            getEndpoint ().getSyntax ().setUuid ( new rpc.core.UUID ( "99fcfec4-5260-101b-bbcb-00aa0021347a" ) );
+            getEndpoint ().getSyntax ().setVersion ( 0, 0 );
+            ( (JIComEndpoint)getEndpoint () ).rebindEndPoint ();
+
+            call ( Endpoint.IDEMPOTENT, this.oxidResolver );
+        }
+        catch ( final FaultException e )
+        {
+            throw new JIException ( e.status, e );
+        }
+        catch ( final IOException e )
+        {
+            throw new JIException ( JIErrorCodes.RPC_E_UNEXPECTED, e );
+        }
+        catch ( final JIRuntimeException e1 )
+        {
+            throw new JIException ( e1 );
+        }
+
+        // Now will setup syntax for IRemUnknown and the address.
+        //syntax = "00000143-0000-0000-c000-000000000046:0.0";
+        this.syntax = interfacePointer.getIID () + ":0.0";
+
+        //now for the new ip and the port.
+
+        final JIStringBinding[] bindings = this.oxidResolver.getOxidBindings ().getStringBindings ();
+
+        binding = null;
+        nameBinding = null;
+        i = 0;
+        //		if (!targetAddress.equals(""))
+        {
+            //now we choose, otherwise the first one we get.
+            while ( i < bindings.length )
+            {
+                binding = bindings[i];
+                if ( binding.getTowerId () != 0x07 ) //this means, even though I asked for TCPIP something else was supplied, noticed this in win2k.
+                {
+                    i++;
+                    continue;
+                }
+                //get the one with IP address
+                int index = binding.getNetworkAddress ().indexOf ( "." );
+                if ( index != -1 )
+                {
+                    try
+                    {
+
+                        if ( binding.getNetworkAddress ().equalsIgnoreCase ( targetAddress ) )
+                        {
+                            nameBinding = null;
+                            break;
+                        }
+
+                        //now check for the one with port
+                        index = binding.getNetworkAddress ().indexOf ( "[" );//this contains the port
+                        if ( index != -1 && binding.getNetworkAddress ().substring ( 0, index ).equalsIgnoreCase ( targetAddress ) )
+                        {
+                            nameBinding = null;
+                            break;
+                        }
+                    }
+                    catch ( final NumberFormatException e )
+                    {
+
+                    }
+                }
+                else
+                {
+                    //can only come for the name, saving it incase nothing matches the target address
+                    nameBinding = binding;
+                }
+                i++;
+            }
+
+            binding = nameBinding == null ? binding : nameBinding;
+        }
+        //		else
+        //		{
+        //			//Just pick up the first one.
+        //			binding = bindings[0];
+        //		}
+
+        //now set the NTLMv2 Session Security.
+        if ( session.isSessionSecurityEnabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.seal", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.sign", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.keyExchange", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.keyLength", "128" );
+            super.getProperties ().setProperty ( "rpc.ntlm.ntlm2", "true" );
+        }
+
+        address = binding.getNetworkAddress (); //this will always have the port.
+        final int index = address.indexOf ( "[" );
+        final String hostname = binding.getNetworkAddress ().substring ( 0, index );
+        final String ipAddr = JISystem.getIPForHostName ( hostname ); //to use the binding supplied by the user.
+        if ( ipAddr != null )
+        {
+            address = ipAddr + address.substring ( index );
+        }
+
+        //and currently only TCPIP is supported.
+        setAddress ( "ncacn_ip_tcp:" + address );
+        this.remunknownIPID = this.oxidResolver.getIPID ();
+        this.interfacePtrCtor = interfacePointer;
+        this.session.setStub ( this );
+        this.session.setStub2 ( new JIRemUnknownServer ( session, this.remunknownIPID, getAddress () ) );
+
+    }
+
+    /**
+     * <p>
+     * <code>JIProgId</code> based constructor with the host machine for COM
+     * server being <i>LOCALHOST</i>.
+     *
+     * @param progId
+     *            user-friendly string such as "Excel.Application" ,
+     *            "TestCOMServer.Test123" etc.
+     * @param session
+     *            session to be associated with.
+     * @throws JIException
+     *             will <i>also</i> get thrown in case the <code>session</code>
+     *             is associated with another server already.
+     * @throws IllegalArgumentException
+     *             raised when either <code>progId</code> or
+     *             <code>session</code> is <code>null</code>.
+     * @throws UnknownHostException
+     */
+    public JIComServer ( final JIProgId progId, final JISession session ) throws JIException, UnknownHostException
+    {
+        this ( progId, InetAddress.getLocalHost ().getHostAddress (), session );
+    }
+
+    /**
+     * <p>
+     * <code>{@link JIClsid}</code> based constructor with the host machine for
+     * COM server being <i>LOCALHOST</i>.
+     *
+     * @param clsid
+     *            128 bit string such as "00024500-0000-0000-C000-000000000046".
+     * @param session
+     *            session to be associated with.
+     * @throws JIException
+     *             will <i>also</i> get thrown in case the <code>session</code>
+     *             is associated with another server already.
+     * @throws IllegalArgumentException
+     *             raised when either <code>clsid</code> or <code>session</code>
+     *             is <code>null</code>.
+     * @throws UnknownHostException
+     */
+    public JIComServer ( final JIClsid clsid, final JISession session ) throws IllegalArgumentException, JIException, UnknownHostException
+    {
+        this ( clsid, InetAddress.getLocalHost ().getHostAddress (), session );
+    }
+
+    /**
+     * <p>
+     * Refer {@link #JIComServer(JIProgId, JISession)} for details.
+     *
+     * @param progId
+     *            user-friendly string such as "Excel.Application" ,
+     *            "TestCOMServer.Test123" etc.
+     * @param address
+     *            address of the host where the <code>COM</code> object
+     *            resides.This should be in the IEEE IP format (e.g.
+     *            192.168.170.6) or a resolvable HostName.
+     * @param session
+     *            session to be associated with.
+     * @throws JIException
+     *             will <i>also</i> get thrown in case the <code>session</code>
+     *             is associated with another server already.
+     * @throws IllegalArgumentException
+     *             raised when any of the parameters is <code>null</code>.
+     * @throws UnknownHostException
+     */
+    public JIComServer ( final JIProgId progId, String address, final JISession session ) throws JIException, UnknownHostException
+    {
+        super ();
+
+        if ( progId == null || address == null || session == null )
+        {
+            throw new IllegalArgumentException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_ILLEGAL_ARGUMENTS ) );
+        }
+
+        if ( session.getStub () != null )
+        {
+            throw new JIException ( JIErrorCodes.JI_SESSION_ALREADY_ESTABLISHED );
+        }
+
+        if ( session.isSSOEnabled () )
+        {
+            throw new IllegalArgumentException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_ILLEGAL_ARGUMENTS2 ) );
+        }
+
+        address = address.trim ();
+        address = InetAddress.getByName ( address ).getHostAddress ();
+
+        progId.setSession ( session );
+        progId.setServer ( address );
+        address = "ncacn_ip_tcp:" + address + "[135]";
+        final JIClsid clsid = progId.getCorrespondingCLSID ();
+        initialise ( clsid, address, session );
+    }
+
+    /**
+     * <p>
+     * Refer {@link #JIComServer(JIClsid, JISession)} for details.
+     *
+     * @param clsid
+     *            128 bit string such as "00024500-0000-0000-C000-000000000046".
+     * @param address
+     *            address of the host where the <code>COM</code> object
+     *            resides.This should be in the IEEE IP format (e.g.
+     *            192.168.170.6) or a resolvable HostName.
+     * @param session
+     *            session to be associated with.
+     * @throws JIException
+     *             will <i>also</i> get thrown in case the <code>session</code>
+     *             is associated with another server already.
+     * @throws IllegalArgumentException
+     *             raised when any of the parameters is <code>null</code>.
+     * @throws UnknownHostException
+     */
+    public JIComServer ( final JIClsid clsid, String address, final JISession session ) throws JIException, UnknownHostException
+    {
+        super ();
+
+        if ( clsid == null || address == null || session == null )
+        {
+            throw new IllegalArgumentException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_ILLEGAL_ARGUMENTS ) );
+        }
+
+        if ( session.getStub () != null )
+        {
+            throw new JIException ( JIErrorCodes.JI_SESSION_ALREADY_ESTABLISHED );
+        }
+
+        address = address.trim ();
+        //address = address.replace(' ','');
+        address = "ncacn_ip_tcp:" + InetAddress.getByName ( address ).getHostAddress () + "[135]";
+
+        initialise ( clsid, address, session );
+    }
+
+    private void initialise ( final JIClsid clsid, final String address, final JISession session ) throws JIException
+    {
+        super.setTransportFactory ( JIComTransportFactory.getSingleTon () );
+        //now read the session and prepare information for the stub.
+        super.setProperties ( new Properties ( defaults ) );
+        super.getProperties ().setProperty ( "rpc.socketTimeout", String.valueOf(session.getGlobalSocketTimeout ()));
+        super.setAddress ( address );
+
+        if ( session.isNTLMv2Enabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.ntlmv2", "true" );
+        }
+
+        if ( session.isSSOEnabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.sso", "true" );
+        }
+        else
+        {
+            super.getProperties ().setProperty ( "rpc.security.username", session.getUserName () );
+            super.getProperties ().setProperty ( "rpc.security.password", session.getPassword () );
+            super.getProperties ().setProperty ( "rpc.ntlm.domain", session.getDomain () );
+
+            /*
+             * Ð’ÐºÐ»ÑŽÑ‡Ð°ÐµÐ¼ signing/sealing Ð´Ð¾ Ð²Ñ‹Ð·Ð¾Ð²Ð° init().
+             * init() Ð²Ñ‹Ð¿Ð¾Ð»Ð½ÑÐµÑ‚ Ð¿ÐµÑ€Ð²Ð¸Ñ‡Ð½ÑƒÑŽ DCOM activation.
+             */
+            if (session.isSessionSecurityEnabled()) {
+                super.getProperties().setProperty(
+                        "rpc.ntlm.sign",
+                        "true"
+                );
+
+                super.getProperties().setProperty(
+                        "rpc.ntlm.seal",
+                        "true"
+                );
+
+                super.getProperties().setProperty(
+                        "rpc.ntlm.keyExchange",
+                        "true"
+                );
+
+                super.getProperties().setProperty(
+                        "rpc.ntlm.keyLength",
+                        "128"
+                );
+
+                super.getProperties().setProperty(
+                        "rpc.ntlm.ntlm2",
+                        "true"
+                );
+            }
+        }
+
+        if ( logger.isInfoEnabled () )
+        {
+            JISystem.internal_dumpMap ();
+        }
+
+        this.clsid = clsid.getCLSID ().toUpperCase ();
+        this.session = session;
+        this.session.setTargetServer ( address.substring ( address.indexOf ( ":" ) + 1, address.indexOf ( "[" ) ) );
+        try
+        {
+            logger.debug(
+                    "DCOM security: sessionSecurity={}, ntlmV2={}, "
+                            + "sign={}, seal={}, keyExchange={}, ntlm2={}",
+                    session.isSessionSecurityEnabled(),
+                    session.isNTLMv2Enabled(),
+                    super.getProperties().getProperty(
+                            "rpc.ntlm.sign"
+                    ),
+                    super.getProperties().getProperty(
+                            "rpc.ntlm.seal"
+                    ),
+                    super.getProperties().getProperty(
+                            "rpc.ntlm.keyExchange"
+                    ),
+                    super.getProperties().getProperty(
+                            "rpc.ntlm.ntlm2"
+                    )
+            );
+            init ();
+        }
+        catch ( final JIException e )
+        {
+            if ( e.getErrorCode () == 0x80040154 )
+            {
+                logger.warn ( "Got the class not registered exception , will attempt setting entries based on status flags..." );
+                //try registering the dll\ocx on our own
+                //check for clsid.autoregister flag
+                //check for jisystem.autoregister flag.
+                //jisystem takes precedence over clsid.
+
+                if ( JISystem.isAutoRegistrationSet () || clsid.isAutoRegistrationSet () )
+                {
+
+                    //first create the registry entries.
+                    try
+                    {
+                        IJIWinReg registry = null;
+                        if ( session.isSSOEnabled () )
+                        {
+                            registry = JIWinRegFactory.getSingleTon ().getWinreg ( session.getTargetServer (), true );
+                        }
+                        else
+                        {
+                            registry = JIWinRegFactory.getSingleTon ().getWinreg ( new JIDefaultAuthInfoImpl ( session.getDomain (), session.getUserName (), session.getPassword () ), session.getTargetServer (), true );
+                        }
+                        final JIPolicyHandle hkcr = registry.winreg_OpenHKCR ();
+                        JIPolicyHandle key = registry.winreg_CreateKey ( hkcr, "CLSID\\{" + this.clsid + "}", IJIWinReg.REG_OPTION_NON_VOLATILE, IJIWinReg.KEY_ALL_ACCESS );
+                        registry.winreg_SetValue ( key, "AppID", ( "{" + this.clsid + "}" ).getBytes (), false, false );
+                        registry.winreg_CloseKey ( key );
+                        key = registry.winreg_CreateKey ( hkcr, "AppID\\{" + this.clsid + "}", IJIWinReg.REG_OPTION_NON_VOLATILE, IJIWinReg.KEY_ALL_ACCESS );
+                        registry.winreg_SetValue ( key, "DllSurrogate", "  ".getBytes (), false, false );
+                        registry.winreg_CloseKey ( key );
+                        registry.winreg_CloseKey ( hkcr );
+                        registry.closeConnection ();
+                    }
+                    catch ( final UnknownHostException e1 )
+                    {
+                        //auto registration failed as well...
+                        logger.warn ( "initialise", e );
+                        throw new JIException ( JIErrorCodes.JI_WINREG_EXCEPTION3, e1 );
+                    }
+                    //lets retry
+                    init ();
+                }
+                else
+                {
+                    throw e;
+                }
+            }
+            else
+            {
+                throw e;
+            }
+
+        }
+
+        this.session.setStub ( this );
+        this.session.setStub2 ( new JIRemUnknownServer ( session, this.remunknownIPID, getAddress () ) );
+    }
+
+    private void init () throws JIException
+    {
+        if ( this.remoteActivation != null && this.remoteActivation.isActivationSuccessful () )
+        {
+            return;
+        }
+
+        boolean attachcomplete = false;
+        try
+        {
+            this.syntax = "99fcfec4-5260-101b-bbcb-00aa0021347a:0.0";
+            attach ();
+            // socket to COM server is established
+            attachcomplete = true;
+            //first send an AlterContext to the IID of the IOxidResolver
+            getEndpoint ().getSyntax ().setUuid ( new rpc.core.UUID ( "99fcfec4-5260-101b-bbcb-00aa0021347a" ) );
+            getEndpoint ().getSyntax ().setVersion ( 0, 0 );
+            ( (JIComEndpoint)getEndpoint () ).rebindEndPoint ();
+
+            //setup syntax for IRemoteActivation
+            this.syntax = "4d9f4ab8-7d1c-11cf-861e-0020af6e7c57:0.0";
+            getEndpoint ().getSyntax ().setUuid ( new rpc.core.UUID ( "4d9f4ab8-7d1c-11cf-861e-0020af6e7c57" ) );
+            getEndpoint ().getSyntax ().setVersion ( 0, 0 );
+            ( (JIComEndpoint)getEndpoint () ).rebindEndPoint ();
+
+            this.remoteActivation = new JIRemActivation ( this.clsid );
+            call ( Endpoint.IDEMPOTENT, this.remoteActivation );
+        }
+        catch ( final FaultException e )
+        {
+            this.remoteActivation = null;
+            throw new JIException ( e.status, e );
+        }
+        catch ( final IOException e )
+        {
+            this.remoteActivation = null;
+            throw new JIException ( JIErrorCodes.RPC_E_UNEXPECTED, e );
+        }
+        catch ( final JIRuntimeException e1 )
+        {
+            this.remoteActivation = null;
+            throw new JIException ( e1 );
+        }
+        finally
+        {
+            //the only time remactivation will be null will be case of an exception.
+            if ( attachcomplete && this.remoteActivation == null )
+            {
+                try
+                {
+                    detach ();
+                }
+                catch ( final IOException e )
+                {
+                    logger.warn ( "Unable to detach during init", e );
+                }
+            }
+        }
+
+        // Now will setup syntax for IRemUnknown and the address.
+        this.syntax = "00000143-0000-0000-c000-000000000046:0.0";
+        //now for the new ip and the port.
+
+        final JIStringBinding[] bindings = this.remoteActivation.getDualStringArrayForOxid ().getStringBindings ();
+        int i = 0;
+        JIStringBinding binding = null;
+        JIStringBinding nameBinding = null;
+        String targetAddress = getAddress ();
+        targetAddress = targetAddress.substring ( targetAddress.indexOf ( ':' ) + 1, targetAddress.indexOf ( '[' ) );
+        while ( i < bindings.length )
+        {
+            binding = bindings[i];
+            if ( binding.getTowerId () != 0x07 ) //this means, even though I asked for TCPIP something else was supplied, noticed this in win2k.
+            {
+                i++;
+                continue;
+            }
+            //get the one with IP address
+            int index = binding.getNetworkAddress ().indexOf ( "." );
+            if ( index != -1 )
+            {
+                try
+                {
+                    //Integer.parseInt(binding.getNetworkAddress().substring(0,index));
+                    index = binding.getNetworkAddress ().indexOf ( "[" );//this contains the port
+                    if ( index != -1 && binding.getNetworkAddress ().substring ( 0, index ).equalsIgnoreCase ( targetAddress ) )
+                    {
+                        break;
+                    }
+                }
+                catch ( final NumberFormatException e )
+                {
+
+                }
+            }
+            else
+            {
+                //can only come for the name, saving it incase nothing matches the target address
+                //then we are not sure which is the right IP and which might be virtual, refer to
+                //issue faced by Igor.
+                nameBinding = binding;
+                index = binding.getNetworkAddress ().indexOf ( "[" );//this contains the port
+                if ( binding.getNetworkAddress ().substring ( 0, index ).equalsIgnoreCase ( targetAddress ) )
+                {
+                    break;
+                }
+            }
+            i++;
+        }
+
+        if ( binding == null )
+        {
+            binding = nameBinding;
+        }
+        //will use this last binding .
+        //and currently only TCPIP is supported.
+        //now set the NTLMv2 Session Security.
+        if ( this.session.isSessionSecurityEnabled () )
+        {
+            super.getProperties ().setProperty ( "rpc.ntlm.seal", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.sign", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.keyExchange", "true" );
+            super.getProperties ().setProperty ( "rpc.ntlm.keyLength", "128" );
+            super.getProperties ().setProperty ( "rpc.ntlm.ntlm2", "true" );
+        }
+
+        String address = binding.getNetworkAddress (); //this will always have the port.
+        final int index = address.indexOf ( "[" );
+        final String hostname = binding.getNetworkAddress ().substring ( 0, index );
+        final String ipAddr = JISystem.getIPForHostName ( hostname ); //to use the binding supplied by the user.
+        if ( ipAddr != null )
+        {
+            address = ipAddr + address.substring ( index );
+        }
+
+        //and currently only TCPIP is supported.
+        setAddress ( "ncacn_ip_tcp:" + address );
+        this.remunknownIPID = this.remoteActivation.getIPID ();
+    }
+
+    //Will give a call to IRemUnknown for the passed IID.
+    IJIComObject getInterface ( final String iid, final String ipidOfTheTargetUnknown ) throws JIException
+    {
+        IJIComObject retval = null;
+        //this is still essentially serial, since all threads will have to wait for mutex before
+        //entering addToSession.
+        synchronized ( this.mutex )
+        {
+            //now also set the Object ID for IRemUnknown call this will be the IPID of the returned JIRemActivation
+            setObject ( this.remunknownIPID );
+            //setObject(ipid);
+
+            //JIRemUnknown reqUnknown = new JIRemUnknown(unknownIPID,iid,5);
+            final JIRemUnknown reqUnknown = new JIRemUnknown ( ipidOfTheTargetUnknown, iid );
+            try
+            {
+                this.session.getStub2 ().call ( Endpoint.IDEMPOTENT, reqUnknown );
+            }
+            catch ( final FaultException e )
+            {
+                throw new JIException ( e.status, e );
+            }
+            catch ( final IOException e )
+            {
+                throw new JIException ( JIErrorCodes.RPC_E_UNEXPECTED, e );
+            }
+            catch ( final JIRuntimeException e1 )
+            {
+                //remoteActivation = null;
+                throw new JIException ( e1 );
+            }
+
+            retval = JIFrameworkHelper.instantiateComObject ( this.session, reqUnknown.getInterfacePointer () );
+            //increasing the reference count.
+            retval.addRef ();
+            //for querying dispatch we can't send another call
+            if ( !iid.equalsIgnoreCase ( "00020400-0000-0000-c000-000000000046" ) )
+            {
+                boolean success = true;
+                ( (JIComObjectImpl)retval ).setIsDual ( true );
+                //now to check whether it supports IDispatch
+                //IDispatch 00020400-0000-0000-c000-000000000046
+                final JIRemUnknown dispatch = new JIRemUnknown ( retval.getIpid (), "00020400-0000-0000-c000-000000000046" );
+                try
+                {
+                    this.session.getStub2 ().call ( Endpoint.IDEMPOTENT, dispatch );
+                }
+                catch ( final FaultException e )
+                {
+                    throw new JIException ( e.status, e );
+                }
+                catch ( final IOException e )
+                {
+                    throw new JIException ( JIErrorCodes.RPC_E_UNEXPECTED, e );
+                }
+                catch ( final JIRuntimeException e1 )
+                {
+                    //will eat this exception here.
+                    ( (JIComObjectImpl)retval ).setIsDual ( false );
+                    success = false;
+                }
+
+                if ( success )
+                {
+                    //which means that IDispatch is supported
+                    this.session.releaseRef ( dispatch.getInterfacePointer ().getIPID (), ( (JIStdObjRef)dispatch.getInterfacePointer ().getObjectReference ( JIInterfacePointer.OBJREF_STANDARD ) ).getPublicRefs () );
+                }
+            }
+        }
+
+        return retval;
+
+    }
+
+    /**
+     * Returns an <code>IJIComObject</code> representing the COM Server.
+     *
+     * @return
+     * @throws JIException
+     */
+    public IJIComObject createInstance () throws JIException
+    {
+        if ( this.interfacePtrCtor != null )
+        {
+            throw new IllegalStateException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_WRONGCALLCREATEINSTANCE ) );
+        }
+        IJIComObject comObject = null;
+
+        //This method is still essentially serial, since all threads will have to stop at mutex and then
+        //go to addToSession after it (since there is no condition).
+        synchronized ( this.mutex )
+        {
+            if ( this.serverInstantiated )
+            {
+                throw new JIException ( JIErrorCodes.JI_OBJECT_ALREADY_INSTANTIATED, (Throwable)null );
+            }
+            //			JIStdObjRef objRef = (JIStdObjRef)(remoteActivation.getMInterfacePointer().getObjectReference(JIInterfacePointer.OBJREF_STANDARD));
+            //			comObject = getObject(objRef.getIpid(),IJIUnknown.IID);
+            comObject = JIFrameworkHelper.instantiateComObject ( this.session, this.remoteActivation.getMInterfacePointer () );
+            if ( this.remoteActivation.isDual )
+            {
+                //IJIComObject comObject2 = getObject(remoteActivation.dispIpid,"00020400-0000-0000-c000-000000000046");
+                //this will get garbage collected and then removed.
+                //session.addToSession(comObject2,remoteActivation.dispOid);
+                this.session.releaseRef ( this.remoteActivation.dispIpid, this.remoteActivation.dispRefs );
+                this.remoteActivation.dispIpid = null;
+                ( (JIComObjectImpl)comObject ).setIsDual ( true );
+            }
+            else
+            {
+                ( (JIComObjectImpl)comObject ).setIsDual ( false );
+            }
+            //increasing the reference count.
+            comObject.addRef ();
+            this.serverInstantiated = true;
+        }
+
+        return comObject;
+    }
+
+    /**
+     * Returns a <code>IJIComObject</code> representing the <code>COM</code>
+     * Server. To be used only with
+     * <code>JIComServer(JISession,JIInterfacePointer,String)</code> ctor,
+     * otherwise use createInstance() instead.
+     *
+     * @return
+     * @throws JIException
+     */
+    IJIComObject getInstance () throws JIException
+    {
+        if ( this.interfacePtrCtor == null )
+        {
+            throw new IllegalStateException ( JISystem.getLocalizedMessage ( JIErrorCodes.JI_COMSTUB_WRONGCALLGETINSTANCE ) );
+        }
+
+        IJIComObject comObject = null;
+        //This method is still essentially serial, since all threads will have to stop at mutex and then
+        //go to addToSession after it (since there is no condition).
+        synchronized ( this.mutex )
+        {
+            if ( this.serverInstantiated )
+            {
+                throw new JIException ( JIErrorCodes.JI_OBJECT_ALREADY_INSTANTIATED, (Throwable)null );
+            }
+
+            //			JIStdObjRef objRef = (JIStdObjRef)(interfacePtrCtor.getObjectReference(JIInterfacePointer.OBJREF_STANDARD));
+            //			comObject = getObject(objRef.getIpid(),interfacePtrCtor.getIID());
+            comObject = JIFrameworkHelper.instantiateComObject ( this.session, this.interfacePtrCtor );
+            //increasing the reference count.
+            comObject.addRef ();
+            this.serverInstantiated = true;
+        }
+
+        return comObject;
+    }
+
+    @Override
+    protected String getSyntax ()
+    {
+        return this.syntax;
+    }
+
+    //	/**
+    //	 * @exclude
+    //	 * @return
+    //	 */
+    //	String getIpid()
+    //	{
+    //		if (remoteActivation != null && remoteActivation.isActivationSuccessful())
+    //		{
+    //			return remoteActivation.getIPID();
+    //		}
+    //		else
+    //			return null;
+    //	}
+
+    /**
+     * Execute a Method on the COM Interface identified by the IID.
+     *
+     * @exclude
+     * @param obj
+     * @param targetIID
+     * @return
+     * @throws JIException
+     */
+    Object[] call ( final JICallBuilder obj, final String targetIID ) throws JIException
+    {
+        return call ( obj, targetIID, this.session.getGlobalSocketTimeout () );
+    }
+
+    /**
+     * Execute a Method on the COM Interface identified by the IID
+     *
+     * @exclude
+     * @param obj
+     * @param targetIID
+     * @return
+     * @throws JIException
+     */
+    Object[] call ( final JICallBuilder obj, final String targetIID, final int socketTimeout ) throws JIException
+    {
+        synchronized ( this.mutex )
+        {
+
+            if ( this.session.isSessionInDestroy () && !obj.fromDestroySession )
+            {
+                throw new JIException ( JIErrorCodes.JI_SESSION_DESTROYED );
+            }
+
+            if ( socketTimeout != 0 )
+            {
+                setSocketTimeOut ( socketTimeout );
+            }
+            else
+            //for cases where it was something earlier, but is now being set to 0.
+            {
+                if ( this.timeoutModifiedfrom0 )
+                {
+                    setSocketTimeOut ( socketTimeout );
+                }
+            }
+
+            try
+            {
+
+                attach ();
+                if ( !getEndpoint ().getSyntax ().getUuid ().toString ().equalsIgnoreCase ( targetIID ) )
+                {
+                    //first send an AlterContext to the IID of the interface
+                    getEndpoint ().getSyntax ().setUuid ( new rpc.core.UUID ( targetIID ) );
+                    getEndpoint ().getSyntax ().setVersion ( 0, 0 );
+                    ( (JIComEndpoint)getEndpoint () ).rebindEndPoint ();
+                }
+
+                setObject ( obj.getParentIpid () );
+                call ( Endpoint.IDEMPOTENT, obj );
+
+            }
+            catch ( final FaultException e )
+            {
+                throw new JIException ( e.status, e );
+            }
+            catch ( final IOException e )
+            {
+                throw new JIException ( JIErrorCodes.RPC_E_UNEXPECTED, e );
+            }
+            catch ( final JIRuntimeException e1 )
+            {
+                throw new JIException ( e1 );
+            }
+
+            return obj.getResults ();
+        }
+
+    }
+
+    /**
+     * @exclude
+     * @return
+     */
+    JIInterfacePointer getServerInterfacePointer ()
+    {
+        //remoteactivation can be null only incase of OxidResolver ctor getting called.
+        return this.remoteActivation == null ? this.interfacePtrCtor : this.remoteActivation.getMInterfacePointer ();
+    }
+
+    void addRef_ReleaseRef ( final JICallBuilder obj ) throws JIException
+    {
+        synchronized ( this.mutex )
+        {
+
+            if ( this.remunknownIPID == null )
+            {
+                return;
+            }
+            //now also set the Object ID for IRemUnknown call this will be the IPID of the returned JIRemActivation or IOxidResolver
+            obj.setParentIpid ( this.remunknownIPID );
+            obj.attachSession ( this.session );
+            try
+            {
+                call ( obj, JIRemUnknown.IID_IUnknown );
+            }
+            catch ( final JIRuntimeException e1 )
+            {
+                throw new JIException ( e1 );
+            }
+
+        }
+    }
+
+    void closeStub ()
+    {
+        try
+        {
+            detach ();
+        }
+        catch ( final Exception e )
+        {
+            //			No need to print this out.
+            //			e.printStackTrace();
+        }
+    }
+
+    void setSocketTimeOut ( final int timeout )
+    {
+        if ( timeout == 0 )
+        {
+            this.timeoutModifiedfrom0 = false;
+        }
+        else
+        {
+            this.timeoutModifiedfrom0 = true;
+        }
+
+        getProperties ().setProperty ( "rpc.socketTimeout", String.valueOf(timeout));
+    }
+
+}
+============================================================
+
+/*
+ * This file is part of the openSCADA project
+ * Copyright (C) 2006-2011 TH4 SYSTEMS GmbH (http://th4-systems.com)
+ *
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * which accompanies this distribution, and is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ */
+
+package org.openscada.opc.lib.da;
+
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledExecutorService;
+
+import org.jinterop.dcom.common.JIException;
+import org.jinterop.dcom.core.JIClsid;
+import org.jinterop.dcom.core.JIComServer;
+import org.jinterop.dcom.core.JIProgId;
+import org.jinterop.dcom.core.JISession;
+import org.openscada.opc.dcom.da.OPCNAMESPACETYPE;
+import org.openscada.opc.dcom.da.OPCSERVERSTATUS;
+import org.openscada.opc.dcom.da.impl.OPCBrowseServerAddressSpace;
+import org.openscada.opc.dcom.da.impl.OPCGroupStateMgt;
+import org.openscada.opc.dcom.da.impl.OPCServer;
+import org.openscada.opc.lib.common.AlreadyConnectedException;
+import org.openscada.opc.lib.common.ConnectionInformation;
+import org.openscada.opc.lib.common.NotConnectedException;
+import org.openscada.opc.lib.da.browser.FlatBrowser;
+import org.openscada.opc.lib.da.browser.TreeBrowser;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class Server
+{
+    private static Logger logger = LoggerFactory.getLogger ( Server.class );
+
+    private final ConnectionInformation connectionInformation;
+
+    private JISession session;
+
+    private JIComServer comServer;
+
+    private OPCServer server;
+
+    private boolean defaultActive = true;
+
+    private int defaultUpdateRate = 1000;
+
+    private Integer defaultTimeBias;
+
+    private Float defaultPercentDeadband;
+
+    private int defaultLocaleID = 0;
+
+    private ErrorMessageResolver errorMessageResolver;
+
+    private final Map<Integer, Group> groups = new HashMap<Integer, Group> ();
+
+    private final List<ServerConnectionStateListener> stateListeners = new CopyOnWriteArrayList<ServerConnectionStateListener> ();
+
+    private final ScheduledExecutorService scheduler;
+
+    public Server ( final ConnectionInformation connectionInformation, final ScheduledExecutorService scheduler )
+    {
+        super ();
+        this.connectionInformation = connectionInformation;
+        this.scheduler = scheduler;
+    }
+
+    /**
+     * Gets the scheduler for the server. Note that this scheduler might get blocked for
+     * a short time if the connection breaks. It should not be used for time critical
+     * operations.
+     * @return the scheduler for the server
+     */
+    public ScheduledExecutorService getScheduler ()
+    {
+        return this.scheduler;
+    }
+
+    protected synchronized boolean isConnected ()
+    {
+        return this.session != null;
+    }
+
+    public synchronized void connect () throws IllegalArgumentException, UnknownHostException, JIException, AlreadyConnectedException
+    {
+        if ( isConnected () )
+        {
+            throw new AlreadyConnectedException ();
+        }
+
+        final int socketTimeout = Integer.getInteger ( "rpc.socketTimeout", 0 );
+        logger.info ( String.format ( "Socket timeout: %s ", socketTimeout ) );
+
+        try
+        {
+            if ( this.connectionInformation.getClsid () != null )
+            {
+                this.session = JISession.createSession ( this.connectionInformation.getDomain (), this.connectionInformation.getUser (), this.connectionInformation.getPassword () );
+                this.session.useSessionSecurity(true);
+                this.session.useNTLMv2(true);
+                this.session.setGlobalSocketTimeout ( socketTimeout );
+                this.comServer = new JIComServer ( JIClsid.valueOf ( this.connectionInformation.getClsid () ), this.connectionInformation.getHost (), this.session );
+            }
+            else if ( this.connectionInformation.getProgId () != null )
+            {
+                this.session = JISession.createSession ( this.connectionInformation.getDomain (), this.connectionInformation.getUser (), this.connectionInformation.getPassword () );
+                this.session.useSessionSecurity(true);
+                this.session.useNTLMv2(true);
+                this.session.setGlobalSocketTimeout ( socketTimeout );
+                this.comServer = new JIComServer ( JIProgId.valueOf ( this.connectionInformation.getProgId () ), this.connectionInformation.getHost (), this.session );
+                System.out.println(
+                        "j-Interop DCOM security: "
+                                + "sessionSecurity="
+                                + this.session.isSessionSecurityEnabled()
+                                + ", ntlmV2="
+                                + this.session.isNTLMv2Enabled()
+                );
+            }
+            else
+            {
+                throw new IllegalArgumentException ( "Neither clsid nor progid is valid!" );
+            }
+
+            this.server = new OPCServer ( this.comServer.createInstance () );
+            this.errorMessageResolver = new ErrorMessageResolver ( this.server.getCommon (), this.defaultLocaleID );
+        }
+        catch ( final UnknownHostException e )
+        {
+            logger.info ( "Unknown host when connecting to server", e );
+            cleanup ();
+            throw e;
+        }
+        catch ( final JIException e )
+        {
+            logger.info ( "Failed to connect to server", e );
+            cleanup ();
+            throw e;
+        }
+        catch ( final Throwable e )
+        {
+            logger.warn ( "Unknown error", e );
+            cleanup ();
+            throw new RuntimeException ( e );
+        }
+
+        notifyConnectionStateChange ( true );
+    }
+
+    /**
+     * cleanup after the connection is closed
+     */
+    protected void cleanup ()
+    {
+        logger.info ( "Destroying DCOM session..." );
+        final JISession destructSession = this.session;
+        final Thread destructor = new Thread ( new Runnable () {
+
+            @Override
+            public void run ()
+            {
+                final long ts = System.currentTimeMillis ();
+                try
+                {
+                    logger.debug ( "Starting destruction of DCOM session" );
+                    JISession.destroySession ( destructSession );
+                    logger.info ( "Destructed DCOM session" );
+                }
+                catch ( final Throwable e )
+                {
+                    logger.warn ( "Failed to destruct DCOM session", e );
+                }
+                finally
+                {
+                    logger.info ( String.format ( "Session destruction took %s ms", System.currentTimeMillis () - ts ) );
+                }
+            }
+        }, "UtgardSessionDestructor" );
+        destructor.setName ( "OPCSessionDestructor" );
+        destructor.setDaemon ( true );
+        destructor.start ();
+        logger.info ( "Destroying DCOM session... forked" );
+
+        this.errorMessageResolver = null;
+        this.session = null;
+        this.comServer = null;
+        this.server = null;
+
+        this.groups.clear ();
+    }
+
+    /**
+     * Disconnect the connection if it is connected
+     */
+    public synchronized void disconnect ()
+    {
+        if ( !isConnected () )
+        {
+            return;
+        }
+
+        try
+        {
+            notifyConnectionStateChange ( false );
+        }
+        catch ( final Throwable t )
+        {
+        }
+
+        cleanup ();
+    }
+
+    /**
+     * Dispose the connection in the case of an error
+     */
+    public void dispose ()
+    {
+        disconnect ();
+    }
+
+    protected synchronized Group getGroup ( final OPCGroupStateMgt groupMgt ) throws JIException, IllegalArgumentException, UnknownHostException
+    {
+        final Integer serverHandle = groupMgt.getState ().getServerHandle ();
+        if ( this.groups.containsKey ( serverHandle ) )
+        {
+            return this.groups.get ( serverHandle );
+        }
+        else
+        {
+            final Group group = new Group ( this, serverHandle, groupMgt );
+            this.groups.put ( serverHandle, group );
+            return group;
+        }
+    }
+
+    /**
+     * Add a new named group to the server
+     * @param name The name of the group to use. Must be unique or <code>null</code> so that the server creates a unique name.
+     * @return The new group
+     * @throws NotConnectedException If the server is not connected using {@link Server#connect()}
+     * @throws IllegalArgumentException
+     * @throws UnknownHostException
+     * @throws JIException
+     * @throws DuplicateGroupException If a group with this name already exists
+     */
+    public synchronized Group addGroup ( final String name ) throws NotConnectedException, IllegalArgumentException, UnknownHostException, JIException, DuplicateGroupException
+    {
+        if ( !isConnected () )
+        {
+            throw new NotConnectedException ();
+        }
+
+        try
+        {
+            final OPCGroupStateMgt groupMgt = this.server.addGroup ( name, this.defaultActive, this.defaultUpdateRate, 0, this.defaultTimeBias, this.defaultPercentDeadband, this.defaultLocaleID );
+            return getGroup ( groupMgt );
+        }
+        catch ( final JIException e )
+        {
+            switch ( e.getErrorCode () )
+            {
+                case 0xC004000C:
+                    throw new DuplicateGroupException ();
+                default:
+                    throw e;
+            }
+        }
+    }
+
+    /**
+     * Add a new group and let the server generate a group name
+     *
+     * Actually this method only calls {@link Server#addGroup(String)} with <code>null</code>
+     * as parameter.
+     *
+     * @return the new group
+     * @throws IllegalArgumentException
+     * @throws UnknownHostException
+     * @throws NotConnectedException
+     * @throws JIException
+     * @throws DuplicateGroupException
+     */
+    public Group addGroup () throws IllegalArgumentException, UnknownHostException, NotConnectedException, JIException, DuplicateGroupException
+    {
+        return addGroup ( null );
+    }
+
+    /**
+     * Find a group by its name
+     * @param name The name to look for
+     * @return The group
+     * @throws IllegalArgumentException
+     * @throws UnknownHostException
+     * @throws JIException
+     * @throws UnknownGroupException If the group was not found
+     * @throws NotConnectedException If the server is not connected
+     */
+    public Group findGroup ( final String name ) throws IllegalArgumentException, UnknownHostException, JIException, UnknownGroupException, NotConnectedException
+    {
+        if ( !isConnected () )
+        {
+            throw new NotConnectedException ();
+        }
+
+        try
+        {
+            final OPCGroupStateMgt groupMgt = this.server.getGroupByName ( name );
+            return getGroup ( groupMgt );
+        }
+        catch ( final JIException e )
+        {
+            switch ( e.getErrorCode () )
+            {
+                case 0x80070057:
+                    throw new UnknownGroupException ( name );
+                default:
+                    throw e;
+            }
+        }
+    }
+
+    public int getDefaultLocaleID ()
+    {
+        return this.defaultLocaleID;
+    }
+
+    public void setDefaultLocaleID ( final int defaultLocaleID )
+    {
+        this.defaultLocaleID = defaultLocaleID;
+    }
+
+    public Float getDefaultPercentDeadband ()
+    {
+        return this.defaultPercentDeadband;
+    }
+
+    public void setDefaultPercentDeadband ( final Float defaultPercentDeadband )
+    {
+        this.defaultPercentDeadband = defaultPercentDeadband;
+    }
+
+    public Integer getDefaultTimeBias ()
+    {
+        return this.defaultTimeBias;
+    }
+
+    public void setDefaultTimeBias ( final Integer defaultTimeBias )
+    {
+        this.defaultTimeBias = defaultTimeBias;
+    }
+
+    public int getDefaultUpdateRate ()
+    {
+        return this.defaultUpdateRate;
+    }
+
+    public void setDefaultUpdateRate ( final int defaultUpdateRate )
+    {
+        this.defaultUpdateRate = defaultUpdateRate;
+    }
+
+    public boolean isDefaultActive ()
+    {
+        return this.defaultActive;
+    }
+
+    public void setDefaultActive ( final boolean defaultActive )
+    {
+        this.defaultActive = defaultActive;
+    }
+
+    /**
+     * Get the flat browser
+     * @return The flat browser or <code>null</code> if the functionality is not supported
+     */
+    public FlatBrowser getFlatBrowser ()
+    {
+        final OPCBrowseServerAddressSpace browser = this.server.getBrowser ();
+        if ( browser == null )
+        {
+            return null;
+        }
+
+        return new FlatBrowser ( browser );
+    }
+
+    /**
+     * Get the tree browser
+     * @return The tree browser or <code>null</code> if the functionality is not supported
+     * @throws JIException
+     */
+    public TreeBrowser getTreeBrowser () throws JIException
+    {
+        final OPCBrowseServerAddressSpace browser = this.server.getBrowser ();
+        if ( browser == null )
+        {
+            return null;
+        }
+
+        if ( browser.queryOrganization () != OPCNAMESPACETYPE.OPC_NS_HIERARCHIAL )
+        {
+            return null;
+        }
+
+        return new TreeBrowser ( browser );
+    }
+
+    public synchronized String getErrorMessage ( final int errorCode )
+    {
+        if ( this.errorMessageResolver == null )
+        {
+            return String.format ( "Unknown error (%08X)", errorCode );
+        }
+
+        // resolve message
+        final String message = this.errorMessageResolver.getMessage ( errorCode );
+
+        // and return if successfull
+        if ( message != null )
+        {
+            return message;
+        }
+
+        // return default message
+        return String.format ( "Unknown error (%08X)", errorCode );
+    }
+
+    public synchronized void addStateListener ( final ServerConnectionStateListener listener )
+    {
+        this.stateListeners.add ( listener );
+        listener.connectionStateChanged ( isConnected () );
+    }
+
+    public synchronized void removeStateListener ( final ServerConnectionStateListener listener )
+    {
+        this.stateListeners.remove ( listener );
+    }
+
+    protected void notifyConnectionStateChange ( final boolean connected )
+    {
+        final List<ServerConnectionStateListener> list = new ArrayList<ServerConnectionStateListener> ( this.stateListeners );
+        for ( final ServerConnectionStateListener listener : list )
+        {
+            listener.connectionStateChanged ( connected );
+        }
+    }
+
+    public OPCSERVERSTATUS getServerState ( final int timeout ) throws Throwable
+    {
+        return new ServerStateOperation ( this.server ).getServerState ( timeout );
+    }
+
+    public OPCSERVERSTATUS getServerState ()
+    {
+        try
+        {
+            return getServerState ( 2500 );
+        }
+        catch ( final Throwable e )
+        {
+            logger.info ( "Server connection failed", e );
+            dispose ();
+            return null;
+        }
+    }
+
+    public void removeGroup ( final Group group, final boolean force ) throws JIException
+    {
+        if ( this.groups.containsKey ( group.getServerHandle () ) )
+        {
+            this.server.removeGroup ( group.getServerHandle (), force );
+            this.groups.remove ( group.getServerHandle () );
+        }
+    }
+}

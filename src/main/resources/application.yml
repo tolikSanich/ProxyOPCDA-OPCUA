@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: OPC-DA-UA-Proxy
+
+
+  # Database Configuration (PostgreSQL 17)
+  datasource:
+    url: jdbc:postgresql://localhost:5432/opc_proxy_db
+    username: postgres
+    password: TestTest # В продакшене использовать Jasypt или переменные окружения
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # Security (Базовая настройка, будет доработана в SecurityConfig)
+  security:
+    user:
+      name: admin
+      password: admin # Заменить на хэш/шифрование
+
+# Custom Application Properties
+app:
+  opcua:
+    port: 4840
+    hostname: localhost
+    application-name: "OPC DA-UA Proxy"
+    application-uri: "urn:opcproxy:ua:application"
+    namespace-uri: "urn:opcproxy:ua"
+    min-publishing-interval-ms: 100
+    default-sampling-interval-ms: 500
+  mqtt:
+    enabled: false
+  csv:
+    separator: ";"
+    encoding: "UTF-8"
+  opcda:
+    default-refresh-period-ms: 1000
+    default-reconnect-interval-ms: 5000
+    max-connections: 10
+    connection-timeout-ms: 10000
+    enable-async-by-default: true
+    reconnect-check-interval-ms: 5000
+    polling-interval-ms: 1000 # <-- НОВЫЙ ПАРАМЕТР: базовый интервал опроса тегов
+
+server:
+  port: 8080
+
+logging:
+  level:
+    root: INFO
+    com.opcproxy: DEBUG
+    org.eclipse.milo: INFO
+    org.jinterop: WARN      # убирает Sending REQUEST/RESPONSE и addUpdateOXIDs
+    rpc: ERROR              # низкоуровневый RPC-транспорт
+    org.jinterop.dcom.core.PingObject: OFF
