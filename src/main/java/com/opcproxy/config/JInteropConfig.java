@@ -26,36 +26,36 @@ public class JInteropConfig {
         log.info("j-Interop configured: rpc.socketTimeout={} ms. "
                         + "NTLM signing/sealing is applied by patched JIComServer (session security).",
                 SOCKET_TIMEOUT_MS);
-        /*
-         * Включает NTLM2/session security в старом RPC-стеке JInterop.
-         */
-        System.setProperty(
-                "rpc.ntlm.ntlm2",
-                "true"
-        );
-
-        /*
-         * Включает NTLM signing.
-         *
-         * В NtlmConnection.java это приводит к:
-         *
-         * Security.PROTECTION_LEVEL_INTEGRITY
-         */
-        System.setProperty(
-                "rpc.ntlm.sign",
-                "true"
-        );
-
-        /*
-         * Не включаем шифрование без необходимости.
-         *
-         * Privacy сильнее Integrity, но для текущего требования
-         * Windows достаточно уровня Packet Integrity.
-         */
-        System.clearProperty("rpc.ntlm.seal");
-
-        log.info(
-                "JInterop configured: rpc.ntlm.ntlm2=true, rpc.ntlm.sign=true"
-        );
+//        /*
+//         * Включает NTLM2/session security в старом RPC-стеке JInterop.
+//         */
+//        System.setProperty(
+//                "rpc.ntlm.ntlm2",
+//                "true"
+//        );
+//
+//        /*
+//         * Включает NTLM signing.
+//         *
+//         * В NtlmConnection.java это приводит к:
+//         *
+//         * Security.PROTECTION_LEVEL_INTEGRITY
+//         */
+//        System.setProperty(
+//                "rpc.ntlm.sign",
+//                "true"
+//        );
+//
+//        /*
+//         * Не включаем шифрование без необходимости.
+//         *
+//         * Privacy сильнее Integrity, но для текущего требования
+//         * Windows достаточно уровня Packet Integrity.
+//         */
+//        System.clearProperty("rpc.ntlm.seal");
+//
+//        log.info(
+//                "JInterop configured: rpc.ntlm.ntlm2=true, rpc.ntlm.sign=true"
+//        );
     }
 }

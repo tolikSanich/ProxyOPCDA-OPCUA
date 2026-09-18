@@ -1,44 +1,82 @@
 package com.opcproxy.opcda;
 
 import com.opcproxy.persistence.entity.OpcDaConnection;
-import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.security.PasswordCipher;
 import lombok.Getter;
-import org.openscada.opc.dcom.da.OPCSERVERSTATUS;
 import org.openscada.opc.lib.common.ConnectionInformation;
+import org.openscada.opc.lib.da.AccessBase;
 import org.openscada.opc.lib.da.Group;
 import org.openscada.opc.lib.da.Item;
+import org.openscada.opc.lib.da.ItemState;
 import org.openscada.opc.lib.da.Server;
+import org.openscada.opc.lib.da.SyncAccess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
+/**
+ * Клиент одного OPC DA-подключения.
+ *
+ * Два режима работы:
+ *  1) Подписка (основной, ТЗ §5.2.3): subscribeAll() создает SyncAccess —
+ *     Utgard сам опрашивает группу с периодом подключения и дергает callback.
+ *     Один group-read за цикл вместо N поштучных DCOM-вызовов.
+ *  2) Поштучный sync-режим (резерв, ТЗ §5.2.4): addItem() + readAllSync().
+ *
+ * Scheduler создается на виртуальных потоках (нужен Utgard'у для AccessBase
+ * и async-механизмов). Патчи Server/JIComServer (session security) применяются
+ * внутри патченных классов из src/main/java.
+ */
 @Getter
 public class OpcDaClient {
+
     private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
 
-    private final OpcDaConnection connectionConfig;
-    private Server server;
-    private Group group;
+    private static final Pattern CLSID_PATTERN = Pattern.compile(
+            "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$");
 
-    @Getter
-    private final Map<String, Item> items = new ConcurrentHashMap<>();
-
-    private final AtomicBoolean connected = new AtomicBoolean(false);
-    private final AtomicInteger errorCount = new AtomicInteger(0);
-    private ReadMode currentReadMode;
-    private volatile long lastDataTimestamp = System.currentTimeMillis();
-
-    public OpcDaClient(OpcDaConnection connectionConfig) {
-        this.connectionConfig = connectionConfig;
-        this.currentReadMode = connectionConfig.getDefaultReadMode();
+    /** Приёмник значения тега из подписки (реализует TagRegistry-обновление). */
+    @FunctionalInterface
+    public interface TagValueSink {
+        void accept(Long tagId, Object value, String quality, Instant timestamp);
     }
 
-    private static final java.util.regex.Pattern CLSID_PATTERN = java.util.regex.Pattern.compile(
-            "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$"
-    );
+    private final OpcDaConnection connectionConfig;
+    private final Long connectionId;
+    private final PasswordCipher passwordCipher;   // <-- новое поле
+
+    private Server server;
+    private Group group;
+    private ScheduledExecutorService scheduler;
+    private volatile AccessBase access;
+
+    private final Map<String, Item> items = new ConcurrentHashMap<>();
+    private final AtomicBoolean connected = new AtomicBoolean(false);
+    private final AtomicInteger errorCount = new AtomicInteger(0);
+    private volatile long lastDataTimestamp = System.currentTimeMillis();
+
+    public OpcDaClient(OpcDaConnection connectionConfig,
+                       com.opcproxy.security.PasswordCipher passwordCipher) {
+        this.connectionConfig = connectionConfig;
+        this.connectionId = connectionConfig.getId();
+        this.passwordCipher = passwordCipher;
+    }
+
+    // ------------------------------------------------------------------
+    // Подключение
+    // ------------------------------------------------------------------
 
     public synchronized void connect() throws Exception {
         if (connected.get()) {
@@ -54,26 +92,33 @@ public class OpcDaClient {
         try {
             ConnectionInformation connInfo = new ConnectionInformation();
             connInfo.setHost(connectionConfig.getHost());
-            connInfo.setUser(connectionConfig.getUsername());
-            connInfo.setPassword(connectionConfig.getPasswordEncrypted());
-            // ВАЖНО: домен должен передаваться явно, иначе j-Interop не сможет
-            // корректно построить NTLM-аутентификацию
+            if (connectionConfig.getPasswordEncrypted() == null || connectionConfig.getPasswordEncrypted().isBlank()) {
+                connInfo.setUser(connectionConfig.getUsername());
+                connInfo.setPassword(passwordCipher.decrypt(connectionConfig.getPasswordEncrypted()));
+            }
             connInfo.setDomain(connectionConfig.getDomain() != null
                     ? connectionConfig.getDomain().trim() : "");
 
             if (clsidMode) {
-                // Убираем фигурные скобки, Utgard сам их добавит
                 String clsid = rawId;
                 if (clsid.startsWith("{")) clsid = clsid.substring(1);
                 if (clsid.endsWith("}")) clsid = clsid.substring(0, clsid.length() - 1);
-                connInfo.setClsid(clsid.toUpperCase(java.util.Locale.ROOT));
+                connInfo.setClsid(clsid.toUpperCase(Locale.ROOT));
                 log.info("Using CLSID: {}", clsid);
             } else {
                 connInfo.setProgId(rawId);
-                log.info("Using ProgID: {} (требует доступа к реестру по SMB!)", rawId);
+                log.info("Using ProgID: {} (требует доступа к реестру по SMB)", rawId);
             }
 
-            server = new Server(connInfo, null);
+            // Scheduler на виртуальных потоках — обязателен для AccessBase (SyncAccess/Async20Access)
+            this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = Thread.ofVirtual()
+                        .name("utgard-sched-" + connectionConfig.getName())
+                        .unstarted(r);
+                return t;
+            });
+
+            server = new Server(connInfo, this.scheduler);
             server.connect();
             group = server.addGroup();
 
@@ -81,62 +126,17 @@ public class OpcDaClient {
             errorCount.set(0);
             log.info("Successfully connected to OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
-            log.error("Failed to connect to OPC DA server: {}", connectionConfig.getName(), e);
+            cleanupScheduler();
             connected.set(false);
+            log.error("Failed to connect to OPC DA server: {}", connectionConfig.getName(), e);
             throw e;
         }
     }
-    /**
-     * Проверка живости канала через штатный механизм Utgard.
-     * Server.getServerState() при неудаче сам вызывает dispose() и возвращает null.
-     */
-    public boolean checkAlive() {
-        if (server == null) {
-            connected.set(false);
-            return false;
-        }
-        OPCSERVERSTATUS status = server.getServerState(); // 2.5s timeout внутри
-        if (status == null) {
-            log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
-            connected.set(false);
-            return false;
-        }
-        return true;
-    }
-    /**
-     * Реакция на ошибку уровня соединения: помечаем канал мёртвым
-     * и освобождаем сессию, чтобы checkAndReconnect поднял новую.
-     */
-    public synchronized void handleConnectionFailure(Throwable e) {
-        String msg = String.valueOf(e.getMessage());
-        boolean fatal = msg.contains("0x8001FFFF")      // j-Interop: внутренняя ошибка (мёртвый канал)
-                || msg.contains("0x80010108")            // RPC_E_DISCONNECTED
-                || msg.contains("0x800706BA")            // RPC_S_SERVER_UNAVAILABLE
-                || msg.contains("Connection reset")
-                || msg.contains("ping failed");
-        if (fatal && connected.get()) {
-            log.warn("Connection-level failure detected for {}: {} — marking lost, reconnect scheduled",
-                    connectionConfig.getName(), msg);
-            markConnectionLost();
-        }
-    }
-
-    public synchronized void markConnectionLost() {
-        connected.set(false);
-        errorCount.incrementAndGet();
-        try {
-            if (server != null) {
-                server.dispose();   // форкнет destroySession в отдельном потоке
-            }
-        } catch (Exception ex) {
-            log.debug("Dispose after failure: {}", ex.getMessage());
-        }
-    }
-
 
     public synchronized void disconnect() {
-        if (!connected.get()) return;
+        if (!connected.get() && server == null) return;
         log.info("Disconnecting from OPC DA server: {}", connectionConfig.getName());
+        stopSubscription();
         try {
             if (group != null) {
                 group.clear();
@@ -147,37 +147,115 @@ public class OpcDaClient {
                 server = null;
             }
             items.clear();
-            connected.set(false);
             log.info("Disconnected from OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
+            // 0x00001051 при shutdown — гонка с jI_ShutdownHook, штатная ситуация
             log.info("Disconnect from {} completed with cleanup note: {}",
                     connectionConfig.getName(), e.getMessage());
+        } finally {
+            cleanupScheduler();
+            connected.set(false);
         }
     }
 
+    // ------------------------------------------------------------------
+    // Подписка (основной режим)
+    // ------------------------------------------------------------------
+
     /**
-     * Добавляет тег и возвращает его. Если тег уже есть, возвращает существующий.
+     * Создает/пересоздает подписку SyncAccess на набор тегов подключения.
+     * Utgard сам опрашивает группу с периодом и вызывает sink на каждое чтение.
+     *
+     * @param tags   теги ЭТОГО подключения (enabled, с непустым sourceItemId)
+     * @param period период опроса группы, мс
+     * @param sink   приемник значений
+     * @return число реально подписанных тегов
      */
+    public synchronized int subscribeAll(Collection<Tag> tags, long periodMs, TagValueSink sink)
+            throws Exception {
+        stopSubscription();
+        if (!connected.get() || server == null) {
+            throw new IllegalStateException("Not connected: " + connectionConfig.getName());
+        }
+        if (tags.isEmpty()) {
+            return 0;
+        }
+
+        log.info("Subscribing {} tags of '{}' with period {} ms",
+                tags.size(), connectionConfig.getName(), periodMs);
+
+        SyncAccess syncAccess = new SyncAccess(server, (int) periodMs);
+        int subscribed = 0;
+        for (Tag tag : tags) {
+            String itemId = tag.getSourceItemId();
+            try {
+                final Long tagId = tag.getId();
+                syncAccess.addItem(itemId, (item, state) ->
+                        deliverValue(tagId, state, sink));
+                subscribed++;
+            } catch (Exception e) {
+                // Не роняем всю подписку из-за одного битого ItemID (ТЗ §5.2.8)
+                log.debug("Subscribe failed for item '{}' (tag '{}'): {}",
+                        itemId, tag.getName(), e.getMessage());
+                sink.accept(tag.getId(), null, "Bad_NotFound",
+                        Instant.now());
+            }
+        }
+        syncAccess.bind();
+        this.access = syncAccess;
+        log.info("Subscribed {} tags of '{}'", subscribed, connectionConfig.getName());
+        return subscribed;
+    }
+
+    /** Останавливает активную подписку (безопасно, если её нет). */
+    public synchronized void stopSubscription() {
+        AccessBase a = this.access;
+        this.access = null;
+        if (a != null) {
+            try {
+                a.unbind();
+            } catch (Exception e) {
+                log.debug("Unbind failed for {}: {}", connectionConfig.getName(), e.getMessage());
+            }
+        }
+    }
+
+    public boolean isSubscribed() {
+        return access != null;
+    }
+
+    private void deliverValue(Long tagId, ItemState state, TagValueSink sink) {
+        try {
+            Object value = OpcDaValues.unwrapVariant(state.getValue());
+            String quality = OpcDaValues.parseOpcQuality(state.getQuality());
+            if (!quality.startsWith("Good")) {
+                value = null;   // не-Good значение скрываем (ошибка №15)
+            }
+            Calendar ts = state.getTimestamp();
+            sink.accept(tagId, value, quality, ts != null ? ts.toInstant() : Instant.now());
+            lastDataTimestamp = System.currentTimeMillis();
+        } catch (Exception e) {
+            log.debug("Deliver value failed for tag {}: {}", tagId, e.getMessage());
+            sink.accept(tagId, null, "Bad_CommunicationFailure", Instant.now());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Поштучный sync-режим (резерв / тестирование)
+    // ------------------------------------------------------------------
+
     public Item addItem(String itemId) throws Exception {
         if (!connected.get() || group == null) {
             throw new IllegalStateException("Not connected to OPC DA server");
         }
-        if (items.containsKey(itemId)) {
-            return items.get(itemId);
-        }
+        Item existing = items.get(itemId);
+        if (existing != null) return existing;
         try {
             Item item = group.addItem(itemId);
             items.put(itemId, item);
-            log.debug("Added item: {} to connection: {}", itemId, connectionConfig.getName());
             return item;
         } catch (Exception e) {
-            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Обработка разрыва DCOM-сессии
-            if (e.getMessage() != null && e.getMessage().contains("0x80010108")) {
-                log.error("DCOM object disconnected (0x80010108) for {}. Marking connection as lost.", connectionConfig.getName());
-                connected.set(false); // Это триггерит логику переподключения в OpcDaConnectionManager
-            } else {
-                log.error("Failed to add item: {} to connection: {}", itemId, connectionConfig.getName(), e);
-            }
+            handleConnectionFailure(e);
             throw e;
         }
     }
@@ -187,26 +265,69 @@ public class OpcDaClient {
         if (item != null && group != null) {
             try {
                 group.removeItem(itemId);
-                log.debug("Removed item: {} from connection: {}", itemId, connectionConfig.getName());
             } catch (Exception e) {
-                log.error("Failed to remove item: {} from connection: {}", itemId, connectionConfig.getName(), e);
+                log.debug("removeItem {} failed: {}", itemId, e.getMessage());
             }
         }
     }
 
-    public Map<String, Item> readAllSync() throws Exception {
-        if (!connected.get() || group == null) {
-            throw new IllegalStateException("Not connected to OPC DA server");
+    /** Разовое чтение одного item (sync-fallback). */
+    public ItemState readSync(String itemId) throws Exception {
+        Item item = addItem(itemId);
+        ItemState state = item.read(false);
+        lastDataTimestamp = System.currentTimeMillis();
+        return state;
+    }
+
+    // ------------------------------------------------------------------
+    // Health / отказоустойчивость
+    // ------------------------------------------------------------------
+
+    /** Активная проверка живости канала; при обрыве Utgard сам делает dispose(). */
+    public boolean checkAlive() {
+        if (server == null) {
+            connected.set(false);
+            return false;
         }
         try {
-            group.read(false);
-            lastDataTimestamp = System.currentTimeMillis();
-            errorCount.set(0);
-            return items;
-        } catch (Exception e) {
-            errorCount.incrementAndGet();
-            log.error("Sync read failed for connection: {}", connectionConfig.getName(), e);
-            throw e;
+            if (server.getServerState() == null) {
+                log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
+                connected.set(false);
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            log.warn("Health check threw for {}: {}", connectionConfig.getName(), t.getMessage());
+            connected.set(false);
+            return false;
+        }
+    }
+
+    /** Реакция на ошибку уровня соединения: помечаем канал мёртвым. */
+    public synchronized void handleConnectionFailure(Throwable e) {
+        String msg = String.valueOf(e.getMessage());
+        boolean fatal = msg.contains("0x8001FFFF")
+                || msg.contains("0x80010108")
+                || msg.contains("0x800706BA")
+                || msg.contains("Connection reset")
+                || msg.contains("ping failed");
+        if (fatal && connected.get()) {
+            log.warn("Connection-level failure for {}: {} — marking lost",
+                    connectionConfig.getName(), msg);
+            markConnectionLost();
+        }
+    }
+
+    public synchronized void markConnectionLost() {
+        connected.set(false);
+        errorCount.incrementAndGet();
+        stopSubscription();
+        try {
+            if (server != null) {
+                server.dispose();
+            }
+        } catch (Exception ex) {
+            log.debug("Dispose after failure: {}", ex.getMessage());
         }
     }
 
@@ -215,13 +336,21 @@ public class OpcDaClient {
     }
 
     public ConnectionState getState() {
-        if (connected.get()) {
-            return ConnectionState.CONNECTED;
-        }
-        return ConnectionState.DISCONNECTED;
+        return connected.get() ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED;
     }
 
     public int getErrorCount() {
         return errorCount.get();
+    }
+
+    // ------------------------------------------------------------------
+    // Внутреннее
+    // ------------------------------------------------------------------
+
+    private void cleanupScheduler() {
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+        }
     }
 }

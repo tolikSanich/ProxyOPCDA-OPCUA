@@ -2,6 +2,9 @@ package com.opcproxy.opcda;
 
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,15 +18,9 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Менеджер подключений к OPC DA серверам.
- *
- * Возможности:
- *  - жизненный цикл подключений (connect / disconnect / reconnect);
- *  - активный health-check живых подключений (Server.getServerState());
- *  - автоматическое переподключение упавших;
- *  - подъём подключений из БД, не сумевших подключиться при старте;
- *  - экспоненциальный backoff для недоступных серверов (5с → 10с → ... → 60с),
- *    чтобы зависший connect не блокировал health-check и поллинг остальных.
+ * Менеджер подключений. Жизненным циклом опроса теперь управляют
+ * виртуальные потоки (ConnectionPoller на каждое подключение);
+ * scheduled-задача осталась только как страховка реконнекта.
  */
 @Slf4j
 @Component
@@ -31,51 +28,41 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OpcDaConnectionManager {
 
     private final OpcDaConnectionRepository connectionRepository;
-
-    /** Активные клиенты (ключ — ID подключения из БД). */
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+    private final PasswordCipher passwordCipher;
     private final Map<Long, OpcDaClient> clients = new ConcurrentHashMap<>();
+    private final Map<Long, ConnectionPoller> pollers = new ConcurrentHashMap<>();
 
-    /** Время (epoch ms), раньше которого не предпринимать попыток подключения. */
     private final Map<Long, Long> nextAttemptAt = new ConcurrentHashMap<>();
-
-    /** Счётчик последовательных неудачных попыток (для backoff). */
     private final Map<Long, Integer> attemptCount = new ConcurrentHashMap<>();
-
-    /** Per-connection блокировки: connect к одному серверу не блокирует остальные. */
     private final Map<Long, Object> locks = new ConcurrentHashMap<>();
 
     private static final long RETRY_BASE_MS = 5_000;
     private static final long RETRY_MAX_MS  = 60_000;
 
     // ------------------------------------------------------------------
-    // Инициализация / завершение
+    // Жизненный цикл
     // ------------------------------------------------------------------
 
-    /**
-     * Инициализация подключений при старте приложения.
-     * Ошибки отдельных подключений не прерывают запуск остальных (изоляция отказов):
-     * упавшие попадут в цикл реконнекта с backoff.
-     */
     @EventListener(ApplicationReadyEvent.class)
     public void init() {
         log.info("Initializing OPC DA Connection Manager...");
-
         connectionRepository.findAll().stream()
                 .filter(OpcDaConnection::getEnabled)
                 .forEach(conn -> {
                     if (!tryConnect(conn)) {
-                        log.warn("Startup connect failed for '{}' — will retry in background (backoff)",
+                        log.warn("Startup connect failed for '{}' — background backoff retry",
                                 conn.getName());
                     }
                 });
-
         log.info("OPC DA Connection Manager initialized. Active connections: {}", clients.size());
     }
 
-    /** Корректное завершение всех подключений при остановке приложения. */
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down OPC DA Connection Manager...");
+        clients.keySet().forEach(this::stopPoller);
         clients.values().forEach(OpcDaClient::disconnect);
         clients.clear();
         nextAttemptAt.clear();
@@ -84,14 +71,9 @@ public class OpcDaConnectionManager {
     }
 
     // ------------------------------------------------------------------
-    // Публичный API (используется UI / REST)
+    // API
     // ------------------------------------------------------------------
 
-    /**
-     * Подключает сервер (если ещё не подключён). Потокобезопасно по id подключения.
-     *
-     * @return true, если подключение установлено (или уже было активно)
-     */
     public boolean tryConnect(OpcDaConnection connection) {
         Long id = connection.getId();
         synchronized (lockFor(id)) {
@@ -99,10 +81,11 @@ public class OpcDaConnectionManager {
                 return true;
             }
             try {
-                OpcDaClient client = new OpcDaClient(connection);
+                OpcDaClient client = new OpcDaClient(connection, passwordCipher);
                 client.connect();
                 clients.put(id, client);
                 clearBackoff(id);
+                startPoller(id, client);
                 log.info("Successfully connected to OPC DA server: {}", connection.getName());
                 return true;
             } catch (Exception e) {
@@ -113,9 +96,9 @@ public class OpcDaConnectionManager {
         }
     }
 
-    /** Отключает и удаляет подключение из пула. */
     public void disconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
+            stopPoller(connectionId);
             OpcDaClient client = clients.remove(connectionId);
             if (client != null) {
                 client.disconnect();
@@ -126,22 +109,22 @@ public class OpcDaConnectionManager {
         }
     }
 
-    /** Принудительное переподключение (UI / REST). Сбрасывает backoff. */
     public void reconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
             OpcDaClient client = clients.get(connectionId);
-            if (client != null) {
-                try {
-                    log.info("Forcing reconnect for: {}", client.getConnectionConfig().getName());
-                    client.disconnect();
-                    client.connect();
-                    clearBackoff(connectionId);
-                } catch (Exception e) {
-                    client.markConnectionLost();          // освободить сессию
-                    scheduleRetry(connectionId);
-                    log.error("Failed to reconnect to OPC DA server: {} ({})",
-                            client.getConnectionConfig().getName(), e.getMessage());
-                }
+            if (client == null) return;
+            try {
+                log.info("Forcing reconnect for: {}", client.getConnectionConfig().getName());
+                stopPoller(connectionId);
+                client.disconnect();
+                client.connect();
+                clearBackoff(connectionId);
+                startPoller(connectionId, client);
+            } catch (Exception e) {
+                client.markConnectionLost();
+                scheduleRetry(connectionId);
+                log.error("Failed to reconnect to {}: {}",
+                        client.getConnectionConfig().getName(), e.getMessage());
             }
         }
     }
@@ -155,40 +138,25 @@ public class OpcDaConnectionManager {
     }
 
     // ------------------------------------------------------------------
-    // Фоновый цикл: health-check + реконнект с backoff
+    // Фоновая страховка реконнекта (поллеры сами держат подписки)
     // ------------------------------------------------------------------
 
-    /**
-     * Фоновая задача. Интервал — app.opcda.reconnect-check-interval-ms.
-     *
-     * 1) Для живых подключений — активный health-check (Server.getServerState();
-     *    при обрыве Utgard сам делает dispose, метод возвращает false).
-     * 2) Для мёртвых и ещё не подключённых из БД — попытка восстановления,
-     *    ограниченная экспоненциальным backoff.
-     */
     @Scheduled(fixedDelayString = "${app.opcda.reconnect-check-interval-ms:5000}")
     public void checkAndReconnect() {
-
-        // --- 1. Health-check и восстановление активных клиентов ---
+        // 1. Мёртвые клиенты из пула
         clients.forEach((id, client) -> {
-            if (client.isConnected()) {
-                if (client.checkAlive()) {
-                    return; // живо
-                }
-                log.warn("Connection '{}' is dead (health check failed), will reconnect",
-                        client.getConnectionConfig().getName());
+            if (client.isConnected() && client.checkAlive()) {
+                return; // живо, поллер работает
             }
             attemptReconnect(id);
         });
 
-        // --- 2. Подъём подключений из БД, отсутствующих в пуле ---
+        // 2. Не подключённые из БД
         connectionRepository.findAll().stream()
                 .filter(OpcDaConnection::getEnabled)
                 .filter(conn -> !clients.containsKey(conn.getId()))
                 .forEach(conn -> {
-                    if (!shouldTry(conn.getId())) {
-                        return; // backoff ещё не истёк
-                    }
+                    if (!shouldTry(conn.getId())) return;
                     if (tryConnect(conn)) {
                         log.info("Auto-reconnect successful for: {}", conn.getName());
                     } else {
@@ -199,38 +167,50 @@ public class OpcDaConnectionManager {
     }
 
     private void attemptReconnect(Long id) {
-        if (!shouldTry(id)) {
-            return;
-        }
+        if (!shouldTry(id)) return;
         synchronized (lockFor(id)) {
             OpcDaClient client = clients.get(id);
             String name = client != null ? client.getConnectionConfig().getName() : ("id=" + id);
             try {
-                if (client != null) {
-                    client.disconnect(); // очистка (безопасна, если уже чисто)
-                }
-                // перечитываем конфиг из БД — могли изменить через UI
+                stopPoller(id);
+                if (client != null) client.disconnect();
+
                 OpcDaConnection conn = connectionRepository.findById(id).orElse(null);
                 if (conn == null || !Boolean.TRUE.equals(conn.getEnabled())) {
-                    if (client != null) {
-                        clients.remove(id);
-                    }
+                    if (client != null) clients.remove(id);
                     return;
                 }
-                OpcDaClient fresh = new OpcDaClient(conn);
+                OpcDaClient fresh = new OpcDaClient(conn, passwordCipher);
                 fresh.connect();
                 clients.put(id, fresh);
                 clearBackoff(id);
+                startPoller(id, fresh);
                 log.info("Auto-reconnect successful for: {}", name);
             } catch (Exception e) {
-                if (client != null) {
-                    client.markConnectionLost();
-                }
+                if (client != null) client.markConnectionLost();
                 scheduleRetry(id);
-                log.warn("Auto-reconnect failed for {}: {} (next attempt in {} ms)",
-                        name, e.getMessage(),
+                log.warn("Auto-reconnect failed for {}: {} (next in {} ms)", name, e.getMessage(),
                         Math.max(0, nextAttemptAt.getOrDefault(id, 0L) - System.currentTimeMillis()));
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Поллеры (виртуальные потоки)
+    // ------------------------------------------------------------------
+
+    private void startPoller(Long id, OpcDaClient client) {
+        stopPoller(id);
+        ConnectionPoller poller = new ConnectionPoller(client, tagRepository, tagRegistry);
+        pollers.put(id, poller);
+        Thread.ofVirtual().name("opc-poller-" + id + "-" + client.getConnectionConfig().getName())
+                .start(poller);
+    }
+
+    private void stopPoller(Long id) {
+        ConnectionPoller poller = pollers.remove(id);
+        if (poller != null) {
+            poller.stop();
         }
     }
 
@@ -244,7 +224,6 @@ public class OpcDaConnectionManager {
 
     private void scheduleRetry(Long id) {
         int attempts = attemptCount.merge(id, 1, Integer::sum);
-        // 5с → 10с → 20с → 40с → 60с (максимум)
         long backoff = Math.min(RETRY_MAX_MS, RETRY_BASE_MS << Math.min(attempts - 1, 10));
         nextAttemptAt.put(id, System.currentTimeMillis() + backoff);
     }

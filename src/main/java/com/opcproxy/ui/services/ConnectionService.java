@@ -5,6 +5,7 @@ import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.security.PasswordCipher;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -20,6 +21,7 @@ public class ConnectionService {
 
     private final OpcDaConnectionRepository connectionRepository;
     private final OpcDaConnectionManager connectionManager;
+    private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
 
     public List<OpcDaConnection> findAll() {
         return connectionRepository.findAll();
@@ -35,6 +37,13 @@ public class ConnectionService {
 
     @Transactional
     public OpcDaConnection save(OpcDaConnection connection) {
+        // Шифруем пароль, если пользователь ввёл новый (plaintext).
+        // Зашифрованное значение (ENC(...)) не трогаем — это read-back из БД.
+        if (connection.getPasswordEncrypted() != null
+                && !passwordCipher.isEncrypted(connection.getPasswordEncrypted())) {
+            connection.setPasswordEncrypted(
+                    passwordCipher.encrypt(connection.getPasswordEncrypted()));
+        }
         OpcDaConnection saved = connectionRepository.save(connection);
 
         if (Boolean.TRUE.equals(saved.getEnabled())) {
@@ -88,7 +97,7 @@ public class ConnectionService {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection);
+        OpcDaClient testClient = new OpcDaClient(connection, passwordCipher);
         try {
             testClient.connect();
             testClient.disconnect();

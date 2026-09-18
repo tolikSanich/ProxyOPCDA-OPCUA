@@ -3,6 +3,7 @@ package com.opcproxy.ui.views;
 import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.security.PasswordCipher;
 import com.opcproxy.ui.MainLayout;
 import com.opcproxy.ui.services.ConnectionService;
 import com.vaadin.flow.component.button.Button;
@@ -38,10 +39,11 @@ public class ConnectionsView extends VerticalLayout {
     private final ConnectionService connectionService;
     private final Grid<OpcDaConnection> grid = new Grid<>();
     private final ConnectionsDialog dialog;
-
-    public ConnectionsView(ConnectionService connectionService) {
+    private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
+    public ConnectionsView(ConnectionService connectionService, PasswordCipher passwordCipher) {
         this.connectionService = connectionService;
         this.dialog = new ConnectionsDialog(connectionService, this::refreshGrid);
+        this.passwordCipher = passwordCipher;
 
         addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
         setWidthFull();
@@ -201,7 +203,7 @@ public class ConnectionsView extends VerticalLayout {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection);
+        OpcDaClient testClient = new OpcDaClient(connection,passwordCipher);
         try {
             testClient.connect();
             testClient.disconnect();

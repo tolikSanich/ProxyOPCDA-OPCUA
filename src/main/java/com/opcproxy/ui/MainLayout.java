@@ -1,9 +1,6 @@
 package com.opcproxy.ui;
 
-import com.opcproxy.ui.views.ConnectionsView;
-import com.opcproxy.ui.views.DashboardView;
-import com.opcproxy.ui.views.MasterDetailView;
-import com.opcproxy.ui.views.TagsView;
+import com.opcproxy.ui.views.*;
 import com.vaadin.flow.component.applayout.AppLayout;
 import com.vaadin.flow.component.html.H1;
 import com.vaadin.flow.component.orderedlayout.FlexComponent;
@@ -51,7 +48,7 @@ public class MainLayout extends AppLayout implements RouterLayout {
         // Внутри метода createDrawer() класса MainLayout.java
         nav.addItem(new SideNavItem("Tags", TagsView.class));
         nav.addItem(new SideNavItem("Servers & Tags", MasterDetailView.class));
-
+        nav.addItem(new SideNavItem("Import/Export", ImportExportView.class));
         drawerLayout.add(nav);
         addToDrawer(drawerLayout);
     }
