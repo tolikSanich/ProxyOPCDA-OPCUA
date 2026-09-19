@@ -37,4 +37,8 @@ public interface TagRepository extends JpaRepository<Tag, Long> {
     @EntityGraph(attributePaths = {"connection", "intervalProfile"})
     @Query("SELECT DISTINCT t FROM Tag t LEFT JOIN FETCH t.connection WHERE t.enabled = true")
     List<Tag> findAllEnabledWithConnection();
+
+    @Query("select (count(t) > 0) from Tag t where t.intervalProfile.id = ?1")
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    boolean existsByIntervalProfileId(Long intervalProfileId);
 }

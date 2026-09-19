@@ -2,6 +2,8 @@ package com.opcproxy.tags;
 
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.persistence.repository.TagRepository;
+import lombok.Data;
+import lombok.Setter;
 import org.slf4j.Logger;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -83,7 +85,7 @@ public class TagRegistry {
         tagValues.remove(tagId);
         log.debug("Unregistered tag: {}", tagId);
     }
-
+    @Data
     public static class TagValue {
         private final String name;
         private volatile Object value;
@@ -94,12 +96,5 @@ public class TagRegistry {
             this.name = name;
         }
 
-        public String getName() { return name; }
-        public Object getValue() { return value; }
-        public void setValue(Object value) { this.value = value; }
-        public String getQuality() { return quality; }
-        public void setQuality(String quality) { this.quality = quality; }
-        public Instant getTimestamp() { return timestamp; }
-        public void setTimestamp(Instant timestamp) { this.timestamp = timestamp; }
     }
 }

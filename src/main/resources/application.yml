@@ -36,7 +36,7 @@ spring:
 # Custom Application Properties
 app:
   opcua:
-    port: 4840
+    port: 55700
     hostname: localhost
     application-name: "OPC DA-UA Proxy"
     application-uri: "urn:opcproxy:ua:application"
@@ -44,12 +44,21 @@ app:
     min-publishing-interval-ms: 100
     default-sampling-interval-ms: 500
   mqtt:
-    enabled: false
+    enabled: true
+    broker: tcp://localhost:1883        # или ssl://...
+    client-id: opc-da-ua-gateway
+    base-topic: gateway/home-pc         # {base-topic}/tags/{tagName}
+    qos: 1                              # 0=at most once, 1=at least once
+    retain: false                       # true = брокер хранит последнее значение
+    config-refresh-ms: 5000
+    buffer-capacity: 10000           # A3: очередь при обрыве брокера
+    publish-interval-ms: 0           # A4: 0 = по изменению; >0 = heartbeat-режим# период обновления снапшота настроек тегов
   csv:
     separator: ";"
     encoding: "UTF-8"
   opcda:
     default-refresh-period-ms: 1000
+    notfound-recheck-ms: 300000      # B5: период речеки Bad_NotFound
     default-reconnect-interval-ms: 5000
     max-connections: 10
     connection-timeout-ms: 10000
@@ -64,6 +73,7 @@ logging:
   level:
     root: INFO
     com.opcproxy: DEBUG
+    com.opcproxy.mqtt: DEBUG
     org.eclipse.milo: INFO
     org.jinterop: WARN      # убирает Sending REQUEST/RESPONSE и addUpdateOXIDs
     rpc: ERROR              # низкоуровневый RPC-транспорт

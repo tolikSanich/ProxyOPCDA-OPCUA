@@ -69,7 +69,20 @@ public class CsvTagService {
             printer.printComment("Generated: " + java.time.LocalDateTime.now()
                     + "; tags: " + tags.size() + "; delimiter: ';'; encoding: UTF-8");
             for (Tag t : tags) {
-                printer.printRecord(/* ...как было... */);
+                printer.printRecord(
+                t.getName(),
+                        t.getSourceType() != null ? t.getSourceType().name() : "",
+                        t.getConnection() != null ? t.getConnection().getName() : "",
+                        nvl(t.getSourceItemId()),
+                        nvl(t.getExpression()),
+                        t.getDataType() != null ? t.getDataType().name() : "",
+                        t.getReadMode() != null ? t.getReadMode().name() : "ASYNC",
+                        nvl(t.getRefreshPeriodMs()),
+                        nvl(t.getUaSamplingIntervalMs()),
+                        "",                                    // intervalProfileName (не резолвим тут)
+                        t.getPublishMqtt() != null ? t.getPublishMqtt() : false,
+                        nvl(t.getMqttDeadband()),
+                        nvl(t.getDescription()));
             }
         }
         return out.toByteArray();

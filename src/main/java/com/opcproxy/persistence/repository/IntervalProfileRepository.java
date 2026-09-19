@@ -8,4 +8,6 @@ import java.util.Optional;
 @Repository
 public interface IntervalProfileRepository extends JpaRepository<IntervalProfile, Long> {
     Optional<IntervalProfile> findByName(String name);
+    boolean existsByName(String name);                                  // seed в сервисе
+    boolean existsByUaSamplingIntervalMs(Integer uaSamplingIntervalMs); // (опц.) диагностика дублей
 }

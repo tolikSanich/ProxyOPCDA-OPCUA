@@ -45,6 +45,9 @@ public class OpcUaServerManager implements DisposableBean {
         started = true;
         doStart();
     }
+    public String getHostname() {
+        return hostname();
+    }
 
     private void doStart() throws Exception {
         if (server != null) {

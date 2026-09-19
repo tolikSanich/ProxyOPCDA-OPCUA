@@ -1,18 +1,23 @@
 package com.opcproxy.ui.views;
 
+import com.opcproxy.calc.CalcDependencyValidator;
 import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.services.ConnectionService;
 import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.DetachEvent;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.checkbox.Checkbox;
 import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.grid.contextmenu.GridContextMenu;
 import com.vaadin.flow.component.html.H2;
 import com.vaadin.flow.component.html.Span;
 import com.vaadin.flow.component.icon.Icon;
@@ -36,12 +41,18 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
  * Master-Detail: слева — серверы (мастер), справа — теги выделенного сервера.
  * Без выделения — все теги. Живые значения, фильтры, цветовая индикация.
+ *
+ * Live-обновления на poll (1 с):
+ *  - значения тегов — напрямую через span-ссылки;
+ *  - статусы серверов (мастер) — через refreshAll() (пересчёт partNameGenerator);
+ *  - качество тегов (detail) — refreshAll() только при изменении сигнатуры качеств.
  */
 @Slf4j
 @PageTitle("Servers & Tags")
@@ -66,29 +77,45 @@ public class MasterDetailView extends VerticalLayout {
     private final TextField tagFilter = new TextField("Tag filter");
     private final Checkbox onlyActiveServers = new Checkbox("Active servers only");
     private final Checkbox onlyGoodTags = new Checkbox("Good tags only");
+    private final Button disableAllServers = new Button("Disable All Servers");
+    private final Button enableAllServers = new Button("Enable All Servers");
+    private final Button detailDisableAll = new Button("Disable All");
+    private final Button detailEnableAll = new Button("Enable All");
 
     private OpcDaConnection selectedServer;      // null = показать все теги
     private ListDataProvider<Tag> detailProvider;
     private ListDataProvider<OpcDaConnection> masterProvider;
 
+    private final IntervalProfileRepository profileRepository;
+    private final CalcDependencyValidator calcValidator;
+
     private final Map<Long, Span> tagValueSpans = new ConcurrentHashMap<>();
     private Registration pollRegistration;
+
+    /** Сигнатура качеств detail-выборки: меняем refreshAll только при изменении. */
+    private volatile int lastQualitySignature = 0;
 
     public MasterDetailView(ConnectionService connectionService,
                             TagService tagService,
                             TagRegistry tagRegistry,
-                            OpcDaConnectionRepository connectionRepository) {
+                            OpcDaConnectionRepository connectionRepository,
+                            IntervalProfileRepository profileRepository,
+                            CalcDependencyValidator calcValidator) {
         this.connectionService = connectionService;
         this.tagService = tagService;
         this.tagRegistry = tagRegistry;
         this.connectionRepository = connectionRepository;
         this.connectionsDialog = new ConnectionsDialog(connectionService, this::refreshMaster);
-        this.tagDialog = new TagDialog(tagService, connectionRepository, this::refreshDetail);
+        this.profileRepository = profileRepository;
+        this.calcValidator = calcValidator;
+        this.tagDialog = new TagDialog(tagService, connectionRepository,
+                calcValidator, this::refreshDetail, profileRepository);
 
         addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
         setSizeFull();
 
         add(createHeader(), createFilters(), createSplit());
+        createMasterContextMenu();
         refreshMaster();
     }
 
@@ -103,10 +130,17 @@ public class MasterDetailView extends VerticalLayout {
         Button addTag = new Button("Add Tag", new Icon(VaadinIcon.PLUS));
         addTag.addClickListener(e -> tagDialog.edit(null));
 
-        HorizontalLayout h = new HorizontalLayout(title, addServer, addTag);
+        HorizontalLayout h = new HorizontalLayout(title, addServer, addTag,
+                enableAllServers, disableAllServers);
         h.setWidthFull();
         h.setAlignItems(FlexComponent.Alignment.CENTER);
         h.expand(title);
+
+        disableAllServers.addThemeVariants(ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_SMALL);
+        disableAllServers.addClickListener(e -> setAllServers(false));
+        enableAllServers.addThemeVariants(ButtonVariant.LUMO_SUCCESS, ButtonVariant.LUMO_SMALL);
+        enableAllServers.addClickListener(e -> setAllServers(true));
+
         return h;
     }
 
@@ -124,7 +158,10 @@ public class MasterDetailView extends VerticalLayout {
         tagFilter.addValueChangeListener(e -> detailGrid.getDataProvider().refreshAll());
 
         onlyActiveServers.addValueChangeListener(e -> masterGrid.getDataProvider().refreshAll());
-        onlyGoodTags.addValueChangeListener(e -> detailGrid.getDataProvider().refreshAll());
+        onlyGoodTags.addValueChangeListener(e -> {
+            lastQualitySignature = 0;   // форс-пересчёт при смене фильтра
+            detailGrid.getDataProvider().refreshAll();
+        });
 
         HorizontalLayout h = new HorizontalLayout(serverFilter, tagFilter,
                 onlyActiveServers, onlyGoodTags);
@@ -143,16 +180,66 @@ public class MasterDetailView extends VerticalLayout {
         masterPanel.setSizeFull();
         masterPanel.setPadding(false);
 
-        VerticalLayout detailPanel = new VerticalLayout(new H2("Tags"), detailGrid);
+        HorizontalLayout detailToolbar = new HorizontalLayout(new H2("Tags"), detailDisableAll, detailEnableAll);
+        detailToolbar.setWidthFull();
+        detailToolbar.setAlignItems(FlexComponent.Alignment.CENTER);
+
+        VerticalLayout detailPanel = new VerticalLayout(detailToolbar, detailGrid);
         detailPanel.setSizeFull();
         detailPanel.setPadding(false);
+
+        detailDisableAll.addThemeVariants(ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_SMALL);
+        detailDisableAll.addClickListener(e -> setAllVisibleTags(false));
+        detailEnableAll.addThemeVariants(ButtonVariant.LUMO_SUCCESS, ButtonVariant.LUMO_SMALL);
+        detailEnableAll.addClickListener(e -> setAllVisibleTags(true));
 
         SplitLayout split = new SplitLayout(masterPanel, detailPanel);
         split.setSizeFull();
         split.setSplitterPosition(45);
         return split;
     }
+    private void setAllServers(boolean enabled) {
+        int n = 0;
+        for (OpcDaConnection c : connectionService.findAll()) {
+            if (Boolean.TRUE.equals(c.getEnabled()) != enabled) n++;
+            connectionService.setEnabled(c.getId(), enabled);   // каскад на теги внутри
+        }
+        Notification.show((enabled ? "Enabled" : "Disabled") + " servers: " + n,
+                2000, Notification.Position.BOTTOM_END);
+        refreshMaster();
+        refreshDetail();
+    }
+    private void createMasterContextMenu() {
+        GridContextMenu<OpcDaConnection> menu = masterGrid.addContextMenu();
 
+        menu.addItem("Edit", e -> e.getItem().ifPresent(c ->
+                connectionsDialog.edit(connectionService.findById(c.getId()).orElse(null))));
+
+        menu.addItem("Enable server", e -> e.getItem()
+                .ifPresent(c -> { connectionService.setEnabled(c.getId(), true); refreshMaster(); refreshDetail(); }));
+        menu.addItem("Disable server", e -> e.getItem()
+                .ifPresent(c -> { connectionService.setEnabled(c.getId(), false); refreshMaster(); refreshDetail(); }));
+
+        menu.addItem("Enable all tags of server", e -> e.getItem().ifPresent(c -> {
+            int n = tagService.setEnabledByConnection(c.getId(), true);
+            Notification.show("Enabled tags: " + n, 2000, Notification.Position.BOTTOM_END);
+            refreshDetail(); refreshMaster();
+        }));
+        menu.addItem("Disable all tags of server", e -> e.getItem().ifPresent(c -> {
+            int n = tagService.setEnabledByConnection(c.getId(), false);
+            Notification.show("Disabled tags: " + n, 2000, Notification.Position.BOTTOM_END);
+            refreshDetail(); refreshMaster();
+        }));
+    }
+    private void setAllVisibleTags(boolean enabled) {
+        List<Long> ids = visibleTags().stream().map(Tag::getId).toList();
+        if (ids.isEmpty()) return;
+        int n = tagService.setEnabledMany(ids, enabled);
+        Notification.show((enabled ? "Enabled" : "Disabled") + " tags: " + n,
+                2000, Notification.Position.BOTTOM_END);
+        refreshDetail();
+        refreshMaster();
+    }
     private void buildMasterGrid() {
         masterGrid.setSizeFull();
         masterGrid.setSelectionMode(Grid.SelectionMode.SINGLE);
@@ -168,19 +255,22 @@ public class MasterDetailView extends VerticalLayout {
         masterGrid.addComponentColumn(this::serverActions)
                 .setHeader("Actions").setFlexGrow(0).setWidth("170px");
 
-        // Класс строки — вынесен в отдельный метод с явным типом
-        masterGrid.setPartNameGenerator(this::masterRowClass);
 
+        // Part-имя строки вынесено в отдельный метод с явным типом
+        masterGrid.setPartNameGenerator(this::masterRowClass);
 
         // Выделение сервера → фильтруем детали
         masterGrid.addSelectionListener(e ->
                 e.getFirstSelectedItem().ifPresentOrElse(
                         this::selectServer,
                         this::clearServerSelection));
+        masterProvider = new ListDataProvider<>(new java.util.ArrayList<>());
+        masterGrid.setDataProvider(masterProvider);
     }
+
     /**
-     * Класс строки мастера: красный — сервер недоступен (не подключён
-     * или выключен), зелёный — подключён.
+     * Part-имя строки мастера: красная — сервер недоступен (не подключён
+     * или выключен), нейтральная — подключён.
      * Вызывается Grid'ом при каждом refreshAll(), поэтому на poll-е
      * строка перекрашивается автоматически.
      */
@@ -188,8 +278,9 @@ public class MasterDetailView extends VerticalLayout {
         boolean enabled = Boolean.TRUE.equals(conn.getEnabled());
         ConnectionState state = connectionService.getStatus(conn.getId());
         boolean connected = enabled && state == ConnectionState.CONNECTED;
-        return connected ? "row-ok" : "row-error";
+        return connected ? null : "row-error";
     }
+
     /**
      * Part-имя строки detail-таблицы: красная — Bad, жёлтая — Uncertain.
      * null = без подсветки.
@@ -204,6 +295,7 @@ public class MasterDetailView extends VerticalLayout {
         }
         return null;
     }
+
     private void buildDetailGrid() {
         detailGrid.setSizeFull();
 
@@ -257,7 +349,6 @@ public class MasterDetailView extends VerticalLayout {
 
     private void refreshMaster() {
         List<OpcDaConnection> all = connectionService.findAll();
-
         boolean onlyActive = onlyActiveServers.getValue();
         String f = serverFilter.getValue() == null ? "" : serverFilter.getValue().toLowerCase();
 
@@ -267,34 +358,37 @@ public class MasterDetailView extends VerticalLayout {
                         || contains(c.getName(), f)
                         || contains(c.getHost(), f)
                         || contains(c.getProgIdOrClsid(), f))
-                .collect(Collectors.toList());
+                .toList();
 
-        masterProvider = new ListDataProvider<>(filtered);
-        masterGrid.setDataProvider(masterProvider);
+        // П.1.1 КЛЮЧ: мутируем коллекцию провайдера, а не подменяем провайдер —
+        // setDataProvider() сбрасывает выделение, refreshAll() — сохраняет.
+        masterProvider.getItems().clear();
+        masterProvider.getItems().addAll(filtered);
+        masterProvider.refreshAll();
 
-        // если выделенный сервер пропал из фильтра — сброс
         if (selectedServer != null && filtered.stream()
                 .noneMatch(c -> c.getId().equals(selectedServer.getId()))) {
-            masterGrid.deselectAll(); // вызовет clearServerSelection
+            masterGrid.deselectAll();
         }
+    }
+    private List<Tag> visibleTags() {
+        String f = tagFilter.getValue() == null ? "" : tagFilter.getValue().toLowerCase();
+        boolean onlyGood = onlyGoodTags.getValue();
+        return currentTags().stream()
+                .filter(t -> f.isEmpty()
+                        || contains(t.getName(), f)
+                        || contains(t.getSourceItemId(), f))
+                .filter(t -> !onlyGood || qualityOf(t).startsWith("Good")).toList();
     }
 
     private void refreshDetail() {
         tagValueSpans.clear();
-
-        String f = tagFilter.getValue() == null ? "" : tagFilter.getValue().toLowerCase();
-        boolean onlyGood = onlyGoodTags.getValue();
-
-        List<Tag> filtered = currentTags().stream()
-                .filter(t -> f.isEmpty()
-                        || contains(t.getName(), f)
-                        || contains(t.getSourceItemId(), f))
-                .filter(t -> !onlyGood || qualityOf(t).startsWith("Good"))
-                .collect(Collectors.toList());
-
-        detailProvider = new ListDataProvider<>(filtered);
+        lastQualitySignature = 0;
+        detailProvider = new ListDataProvider<>(visibleTags());
         detailGrid.setDataProvider(detailProvider);
     }
+
+
 
     private static boolean contains(String s, String lower) {
         return s != null && s.toLowerCase().contains(lower);
@@ -426,21 +520,40 @@ public class MasterDetailView extends VerticalLayout {
         return h;
     }
 
+    // ---------------- Quality signature (для умного refresh) ----------------
+
+    /** Сумма хэшей (tagId + quality) — меняется при любом изменении качества видимых тегов. */
+    private int qualitySignature() {
+        return currentTags().stream()
+                .mapToInt(t -> Objects.hash(t.getId(), qualityOf(t)))
+                .reduce(0, Integer::sum);
+    }
+
     // ---------------- Live updates ----------------
 
     @Override
-    protected void onAttach(com.vaadin.flow.component.AttachEvent event) {
+    protected void onAttach(AttachEvent event) {
         super.onAttach(event);
         UI ui = event.getUI();
         ui.setPollInterval(1000);
         pollRegistration = ui.addPollListener(e -> {
+            // 1. Значения — напрямую (без пересборки строк)
             tagValueSpans.keySet().forEach(this::applyValue);
-            masterGrid.getDataProvider().refreshAll(); // пересчитывает masterRowClass
+
+            // 2. Quality-бейджи и подсветка строк detail — только при изменении качества
+            int sig = qualitySignature();
+            if (sig != lastQualitySignature) {
+                lastQualitySignature = sig;
+                detailGrid.getDataProvider().refreshAll();   // пересчитывает detailRowClass + бейджи
+            }
+
+            // 3. Статусы серверов (мастер) — пересчёт masterRowClass
+            masterGrid.getDataProvider().refreshAll();
         });
     }
 
     @Override
-    protected void onDetach(com.vaadin.flow.component.DetachEvent event) {
+    protected void onDetach(DetachEvent event) {
         if (pollRegistration != null) {
             pollRegistration.remove();
             pollRegistration = null;

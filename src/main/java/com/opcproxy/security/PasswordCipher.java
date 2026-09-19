@@ -34,11 +34,12 @@ public class PasswordCipher {
     public String decrypt(String stored) {
         if (stored == null || stored.isBlank()) return stored;
         if (!isEncrypted(stored)) {
-            log.warn("Found PLAINTEXT password in DB (legacy) — will be encrypted on next save");
+            log.warn("decrypt: PLAINTEXT in DB (legacy) — length {}", stored.length());
             return stored;
         }
-        String body = stored.substring(PREFIX.length(), stored.length() - SUFFIX.length());
-        return encryptor.decrypt(body);
+        String plain = encryptor.decrypt(stored.substring(PREFIX.length(), stored.length() - SUFFIX.length()));
+        log.debug("decrypt: successfully decrypted (len={})", plain.length());   // НИКОГДА не логируем значение
+        return plain;
     }
 
     public boolean isEncrypted(String stored) {

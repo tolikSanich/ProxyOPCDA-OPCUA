@@ -151,12 +151,7 @@
             <artifactId>jasypt-spring-boot-starter</artifactId>
             <version>3.0.5</version>
         </dependency>
-        <!-- BouncyCastle (overrides transitive version from eclipse-milo) -->
-        <dependency>
-            <groupId>org.bouncycastle</groupId>
-            <artifactId>bcprov-jdk18on</artifactId>
-            <version>1.80</version>
-        </dependency>
+
 
         <!-- API Documentation -->
         <dependency>

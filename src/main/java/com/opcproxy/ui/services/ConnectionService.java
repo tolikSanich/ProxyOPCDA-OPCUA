@@ -6,6 +6,7 @@ import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -22,6 +23,8 @@ public class ConnectionService {
     private final OpcDaConnectionRepository connectionRepository;
     private final OpcDaConnectionManager connectionManager;
     private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
+    private final TagRegistry tagRegistry;
+    private final TagService tagService;
 
     public List<OpcDaConnection> findAll() {
         return connectionRepository.findAll();
@@ -39,6 +42,12 @@ public class ConnectionService {
     public OpcDaConnection save(OpcDaConnection connection) {
         // Шифруем пароль, если пользователь ввёл новый (plaintext).
         // Зашифрованное значение (ENC(...)) не трогаем — это read-back из БД.
+        String pwd = connection.getPasswordEncrypted();
+        if (pwd != null && (pwd.contains("•") || pwd.contains("(установлен)"))) {
+            // Маска попала в entity — игнорируем, оставляем старый пароль
+            connectionRepository.findById(connection.getId())
+                    .ifPresent(old -> connection.setPasswordEncrypted(old.getPasswordEncrypted()));
+        }
         if (connection.getPasswordEncrypted() != null
                 && !passwordCipher.isEncrypted(connection.getPasswordEncrypted())) {
             connection.setPasswordEncrypted(
@@ -70,11 +79,16 @@ public class ConnectionService {
         connectionRepository.findById(id).ifPresent(conn -> {
             conn.setEnabled(enabled);
             connectionRepository.save(conn);
+            // П.1.2/п.2: теги сервера следуют за сервером; при выключении
+            // каждый получает Bad_ServerDisabled (в т.ч. в OPC UA)
+            tagService.setEnabledByConnection(id, enabled);
+            connectionManager.disconnect(id);
             if (enabled) {
-                connectionManager.disconnect(id);
-                connectionManager.tryConnect(conn);
-            } else {
-                connectionManager.disconnect(id);
+                if (connectionManager.tryConnect(conn)) {
+                    log.info("Connection '{}' (re)connected after enable", conn.getName());
+                } else {
+                    log.warn("Connection '{}' enabled but not connected — background retry", conn.getName());
+                }
             }
         });
     }
@@ -97,7 +111,7 @@ public class ConnectionService {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection, passwordCipher);
+        OpcDaClient testClient = new OpcDaClient(connection, passwordCipher, tagRegistry);
         try {
             testClient.connect();
             testClient.disconnect();

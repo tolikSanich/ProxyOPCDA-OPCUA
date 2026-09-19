@@ -13,7 +13,8 @@ import java.time.LocalDateTime;
 @Data
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
-@Table(name = "interval_profile")
+@Table(name = "interval_profile",
+        uniqueConstraints = @UniqueConstraint(name = "uq_interval_profile_name", columnNames = "name"))
 public class IntervalProfile {
 
     @Id

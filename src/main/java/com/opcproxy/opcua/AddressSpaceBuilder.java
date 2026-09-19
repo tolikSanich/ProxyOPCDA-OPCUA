@@ -11,6 +11,7 @@ import org.eclipse.milo.opcua.sdk.core.AccessLevel;
 import org.eclipse.milo.opcua.sdk.core.Reference;
 import org.eclipse.milo.opcua.sdk.server.ManagedNamespaceWithLifecycle;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.SessionListener;
 import org.eclipse.milo.opcua.sdk.server.items.DataItem;
 import org.eclipse.milo.opcua.sdk.server.items.MonitoredItem;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaFolderNode;
@@ -34,6 +35,7 @@ public class AddressSpaceBuilder {
     private final TagRegistry tagRegistry;
     private final TagRepository tagRepository;
     private final OpcUaConfig opcUaConfig;   // namespace URI из конфигурации
+    private final SamplingIntervalResolver samplingResolver;
 
     private volatile boolean built = false;
     private CustomNamespace namespace;
@@ -55,6 +57,19 @@ public class AddressSpaceBuilder {
         namespace.startup();
 
         buildAddressSpace();
+        server.getSessionManager().addSessionListener(new SessionListener() {
+            @Override
+            public void onSessionCreated(org.eclipse.milo.opcua.sdk.server.Session session) {
+                log.info("UA session created: id={}, app='{}'",
+                        session.getSessionId(), session.getSessionName());
+            }
+
+            @Override
+            public void onSessionClosed(org.eclipse.milo.opcua.sdk.server.Session session) {
+                log.info("UA session closed: id={}, app='{}'",
+                        session.getSessionId(), session.getSessionName());
+            }
+        });
     }
 
     private void buildAddressSpace() {
@@ -95,7 +110,9 @@ public class AddressSpaceBuilder {
         for (Tag tag : tags) {
             createTagNode(tag, tagsFolder, sourcesFolder);
         }
-
+        log.info("Building OPC UA Address Space...");
+        log.info(">>> Custom namespace index = {} (URI: {})",
+                namespace.getNamespaceIndex(), opcUaConfig.getNamespaceUri());
         log.info("Address Space built successfully. Total enabled tags: {}", tags.size());
     }
 
@@ -118,10 +135,11 @@ public class AddressSpaceBuilder {
                 .setUserAccessLevel(EnumSet.of(AccessLevel.CurrentRead))
                 .setValue(new DataValue(new Variant(initialValue)))
                 .build();
-
+        // ТЗ §5.3: эффективный интервал тега как MinimumSamplingInterval узла.
+        // SDK Milo сам ревизует слишком быстрые запросы клиентов (см. milo#517).
+        variableNode.setMinimumSamplingInterval(samplingResolver.resolve(tag));
         namespace.getNodeManager().addNode(variableNode);
         tagIdToNodeIdMap.put(tag.getId(), nodeId);
-
         tagsFolder.addOrganizes(variableNode);
 
         // Иерархия Sources/<Connection>/<Tag>
@@ -206,7 +224,9 @@ public class AddressSpaceBuilder {
         }
 
         @Override
-        public void onDataItemsCreated(List<DataItem> dataItems) { }
+        public void onDataItemsCreated(List<DataItem> dataItems) {
+
+        }
 
         @Override
         public void onDataItemsModified(List<DataItem> dataItems) { }

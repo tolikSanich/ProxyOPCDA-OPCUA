@@ -3,6 +3,7 @@ package com.opcproxy.opcda;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import lombok.Getter;
 import org.openscada.opc.lib.common.ConnectionInformation;
 import org.openscada.opc.lib.da.AccessBase;
@@ -15,10 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
-import java.util.Calendar;
-import java.util.Collection;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -28,26 +26,34 @@ import java.util.regex.Pattern;
 
 /**
  * Клиент одного OPC DA-подключения.
- *
+ * <p>
  * Два режима работы:
- *  1) Подписка (основной, ТЗ §5.2.3): subscribeAll() создает SyncAccess —
- *     Utgard сам опрашивает группу с периодом подключения и дергает callback.
- *     Один group-read за цикл вместо N поштучных DCOM-вызовов.
- *  2) Поштучный sync-режим (резерв, ТЗ §5.2.4): addItem() + readAllSync().
- *
+ * 1) Подписка (основной, ТЗ §5.2.3): subscribeAll() создает SyncAccess —
+ * Utgard сам опрашивает группу с периодом подключения и дергает callback.
+ * Один group-read за цикл вместо N поштучных DCOM-вызовов.
+ * 2) Поштучный sync-режим (резерв, ТЗ §5.2.4): addItem() + readAllSync().
+ * <p>
  * Scheduler создается на виртуальных потоках (нужен Utgard'у для AccessBase
  * и async-механизмов). Патчи Server/JIComServer (session security) применяются
  * внутри патченных классов из src/main/java.
  */
 @Getter
 public class OpcDaClient {
-
+    /**
+     * ItemID, которые не удалось подписать (ТЗ §5.2.8); перепроверяются по расписанию.
+     */
+    private final java.util.Set<String> notFoundItemIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
-
+    private static final Set<Class<?>> UA_SAFE = Set.of(
+            Boolean.class, Byte.class, Short.class, Integer.class, Long.class,
+            Float.class, Double.class, String.class,
+            org.eclipse.milo.opcua.stack.core.types.builtin.DateTime.class);  // ← было OffsetDateTime/Instant
     private static final Pattern CLSID_PATTERN = Pattern.compile(
             "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$");
 
-    /** Приёмник значения тега из подписки (реализует TagRegistry-обновление). */
+    /**
+     * Приёмник значения тега из подписки (реализует TagRegistry-обновление).
+     */
     @FunctionalInterface
     public interface TagValueSink {
         void accept(Long tagId, Object value, String quality, Instant timestamp);
@@ -56,7 +62,7 @@ public class OpcDaClient {
     private final OpcDaConnection connectionConfig;
     private final Long connectionId;
     private final PasswordCipher passwordCipher;   // <-- новое поле
-
+    private final TagRegistry tagRegistry;
     private Server server;
     private Group group;
     private ScheduledExecutorService scheduler;
@@ -67,11 +73,14 @@ public class OpcDaClient {
     private final AtomicInteger errorCount = new AtomicInteger(0);
     private volatile long lastDataTimestamp = System.currentTimeMillis();
 
+
+
     public OpcDaClient(OpcDaConnection connectionConfig,
-                       com.opcproxy.security.PasswordCipher passwordCipher) {
+                       PasswordCipher passwordCipher, TagRegistry tagRegistry) {
         this.connectionConfig = connectionConfig;
         this.connectionId = connectionConfig.getId();
         this.passwordCipher = passwordCipher;
+        this.tagRegistry = tagRegistry;
     }
 
     // ------------------------------------------------------------------
@@ -92,10 +101,8 @@ public class OpcDaClient {
         try {
             ConnectionInformation connInfo = new ConnectionInformation();
             connInfo.setHost(connectionConfig.getHost());
-            if (connectionConfig.getPasswordEncrypted() == null || connectionConfig.getPasswordEncrypted().isBlank()) {
-                connInfo.setUser(connectionConfig.getUsername());
-                connInfo.setPassword(passwordCipher.decrypt(connectionConfig.getPasswordEncrypted()));
-            }
+            connInfo.setUser(connectionConfig.getUsername());
+            connInfo.setPassword(passwordCipher.decrypt(connectionConfig.getPasswordEncrypted()));
             connInfo.setDomain(connectionConfig.getDomain() != null
                     ? connectionConfig.getDomain().trim() : "");
 
@@ -133,6 +140,14 @@ public class OpcDaClient {
         }
     }
 
+    public boolean hasNotFoundItems() {
+        return !notFoundItemIds.isEmpty();
+    }
+
+    public int getNotFoundCount() {
+        return notFoundItemIds.size();
+    }
+
     public synchronized void disconnect() {
         if (!connected.get() && server == null) return;
         log.info("Disconnecting from OPC DA server: {}", connectionConfig.getName());
@@ -147,6 +162,7 @@ public class OpcDaClient {
                 server = null;
             }
             items.clear();
+            notFoundItemIds.clear();
             log.info("Disconnected from OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
             // 0x00001051 при shutdown — гонка с jI_ShutdownHook, штатная ситуация
@@ -192,22 +208,26 @@ public class OpcDaClient {
                 final Long tagId = tag.getId();
                 syncAccess.addItem(itemId, (item, state) ->
                         deliverValue(tagId, state, sink));
+                notFoundItemIds.remove(itemId);      // <-- ДОБАВИТЬ: подписался — снимаем метку
                 subscribed++;
             } catch (Exception e) {
-                // Не роняем всю подписку из-за одного битого ItemID (ТЗ §5.2.8)
                 log.debug("Subscribe failed for item '{}' (tag '{}'): {}",
                         itemId, tag.getName(), e.getMessage());
-                sink.accept(tag.getId(), null, "Bad_NotFound",
-                        Instant.now());
+                notFoundItemIds.add(itemId);          // <-- ДОБАВИТЬ
+                sink.accept(tag.getId(), null, "Bad_NotFound", Instant.now());
             }
         }
         syncAccess.bind();
         this.access = syncAccess;
         log.info("Subscribed {} tags of '{}'", subscribed, connectionConfig.getName());
+        if (!notFoundItemIds.isEmpty()) log.warn("{} item(s) still not found on '{}'",
+                notFoundItemIds.size(), connectionConfig.getName());
         return subscribed;
     }
 
-    /** Останавливает активную подписку (безопасно, если её нет). */
+    /**
+     * Останавливает активную подписку (безопасно, если её нет).
+     */
     public synchronized void stopSubscription() {
         AccessBase a = this.access;
         this.access = null;
@@ -229,7 +249,12 @@ public class OpcDaClient {
             Object value = OpcDaValues.unwrapVariant(state.getValue());
             String quality = OpcDaValues.parseOpcQuality(state.getQuality());
             if (!quality.startsWith("Good")) {
-                value = null;   // не-Good значение скрываем (ошибка №15)
+                value = null;
+            } else if (value != null && !UA_SAFE.contains(value.getClass())) {
+                // неизвестный тип — приводим к строке, чтобы не уронить UA-кодировщик
+                log.debug("Coercing unsupported value type {} for tag {}",
+                        value.getClass().getName(), tagId);
+                value = String.valueOf(value);
             }
             Calendar ts = state.getTimestamp();
             sink.accept(tagId, value, quality, ts != null ? ts.toInstant() : Instant.now());
@@ -256,6 +281,8 @@ public class OpcDaClient {
             return item;
         } catch (Exception e) {
             handleConnectionFailure(e);
+            notFoundItemIds.add(itemId);
+            log.debug("addItem failed for '{}': {}", itemId, e.getMessage());
             throw e;
         }
     }
@@ -271,7 +298,9 @@ public class OpcDaClient {
         }
     }
 
-    /** Разовое чтение одного item (sync-fallback). */
+    /**
+     * Разовое чтение одного item (sync-fallback).
+     */
     public ItemState readSync(String itemId) throws Exception {
         Item item = addItem(itemId);
         ItemState state = item.read(false);
@@ -283,7 +312,9 @@ public class OpcDaClient {
     // Health / отказоустойчивость
     // ------------------------------------------------------------------
 
-    /** Активная проверка живости канала; при обрыве Utgard сам делает dispose(). */
+    /**
+     * Активная проверка живости канала; при обрыве Utgard сам делает dispose().
+     */
     public boolean checkAlive() {
         if (server == null) {
             connected.set(false);
@@ -303,12 +334,16 @@ public class OpcDaClient {
         }
     }
 
-    /** Реакция на ошибку уровня соединения: помечаем канал мёртвым. */
+    /**
+     * Реакция на ошибку уровня соединения: помечаем канал мёртвым.
+     */
     public synchronized void handleConnectionFailure(Throwable e) {
         String msg = String.valueOf(e.getMessage());
         boolean fatal = msg.contains("0x8001FFFF")
                 || msg.contains("0x80010108")
                 || msg.contains("0x800706BA")
+                || msg.contains("0x800703FA")     // сервер не может перезапуститься (service)
+                || msg.contains("0x800700A4")     // threads exhausted на сервере
                 || msg.contains("Connection reset")
                 || msg.contains("ping failed");
         if (fatal && connected.get()) {

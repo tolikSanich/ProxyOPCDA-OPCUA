@@ -24,6 +24,528 @@ public class Application implements AppShellConfigurator {
 
 ============================================================
 
+package com.opcproxy;
+
+import org.jasypt.encryption.StringEncryptor;
+import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+
+public class RepairPassword {
+    public static void main(String[] args) {
+        System.setProperty("jasypt.encryptor.password", args[0]);
+        var ctx = new SpringApplicationBuilder()
+                .sources(Application.class).web(WebApplicationType.NONE)
+                .run();
+        var enc = ctx.getBean(StringEncryptor.class);
+        System.out.println("ENC(" + enc.encrypt(args[1]) + ")");
+        ctx.close();
+    }
+// java -jar app.jar <master> <plain-password>
+}
+
+============================================================
+
+package com.opcproxy.calc;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.TagRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * Валидатор CALC-формул (ТЗ §5.4.5):
+ *  - существование ссылок (#TagName);
+ *  - обнаружение циклических зависимостей (DFS);
+ *  - ограничение глубины цепочки CALC->CALC (<= 10);
+ *  - запрет ссылки тега на самого себя.
+ */
+@Component
+@RequiredArgsConstructor
+public class CalcDependencyValidator {
+
+    /** Ссылка на тег: #ИмяТега (буквы/цифры/подчёркивание). */
+    private static final Pattern TAG_REF = Pattern.compile("#([A-Za-z_][A-Za-z0-9_]*)");
+    private static final int MAX_DEPTH = 10;
+
+    private final TagRepository tagRepository;
+
+    public record ValidationResult(List<String> errors) {
+        public boolean ok() { return errors.isEmpty(); }
+    }
+
+    /**
+     * Полная проверка формулы тега (для UI-диалога и CSV-импорта).
+     *
+     * @param calcTag проверяемый CALC-тег (name + expression)
+     */
+    public ValidationResult validate(Tag calcTag) {
+        List<String> errors = new ArrayList<>();
+        String expr = calcTag.getExpression();
+        if (expr == null || expr.isBlank()) {
+            errors.add("Формула пуста");
+            return new ValidationResult(errors);
+        }
+        if (expr.length() > 2000) {
+            errors.add("Формула длиннее 2000 символов");
+        }
+
+        // Синтаксис — через движок (компиляция без вычисления)
+        try {
+            new SpelExpressionParser().parseExpression(expr);
+        } catch (Exception e) {
+            errors.add("Синтаксическая ошибка: " + e.getMessage());
+            return new ValidationResult(errors); // дальше разбирать нечего
+        }
+
+        Map<String, Tag> byName = tagRepository.findAll().stream()
+                .collect(Collectors.toMap(Tag::getName, t -> t, (a, b) -> a));
+
+        // Ссылки
+        List<String> refs = extractRefs(expr);
+        if (refs.isEmpty()) {
+            errors.add("Формула не содержит ссылок на теги (#ИмяТега)");
+        }
+        for (String ref : refs) {
+            if (!byName.containsKey(ref)) {
+                errors.add("Неизвестный тег в формуле: #" + ref);
+            } else if (ref.equals(calcTag.getName())) {
+                errors.add("Циклическая зависимость: тег ссылается сам на себя");
+            }
+        }
+        if (!errors.isEmpty()) {
+            return new ValidationResult(errors);
+        }
+
+        // Циклы и глубина: DFS от этого тега по CALC-зависимостям
+        Set<String> visited = new HashSet<>();
+        Deque<String> path = new ArrayDeque<>();
+        dfs(calcTag.getName(), byName, visited, path, errors, 0);
+
+        return new ValidationResult(errors);
+    }
+
+    private void dfs(String current, Map<String, Tag> byName,
+                     Set<String> visited, Deque<String> path,
+                     List<String> errors, int depth) {
+        if (depth > MAX_DEPTH) {
+            errors.add("Превышена глубина цепочки CALC-тегов (> " + MAX_DEPTH + "): "
+                    + String.join(" -> ", path));
+            return;
+        }
+        if (path.contains(current)) {
+            errors.add("Циклическая зависимость: "
+                    + String.join(" -> ", path) + " -> " + current);
+            return;
+        }
+        Tag tag = byName.get(current);
+        if (tag == null || tag.getSourceType() != com.opcproxy.persistence.enums.SourceType.CALC) {
+            return; // DA-тег — лист графа
+        }
+        path.push(current);
+        for (String ref : extractRefs(tag.getExpression())) {
+            if (!visited.contains(ref) || path.contains(ref)) {
+                dfs(ref, byName, visited, path, errors, depth + 1);
+            }
+        }
+        visited.add(current);
+        path.pop();
+    }
+
+    /** Ссылки формулы (публично — используется CalcEngineService). */
+    public List<String> extractRefs(String expression) {
+        if (expression == null) return List.of();
+        List<String> refs = new ArrayList<>();
+        Matcher m = TAG_REF.matcher(expression);
+        while (m.find()) {
+            refs.add(m.group(1));
+        }
+        return refs.stream().distinct().toList();
+    }
+}
+============================================================
+
+package com.opcproxy.calc;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.DataType;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Сервис расчёта CALC-тегов (ТЗ §5.2.4 — режим SYNC по расписанию).
+ *
+ * Один виртуальный поток пересчитывает все CALC-теги по их refreshPeriodMs.
+ * Качество результата: Good — если ВСЕ входы Good; иначе Bad_DependencyBad (§5.4.6).
+ * Результат публикуется через TagRegistry -> событие -> UI + OPC UA автоматически.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CalcEngineService {
+
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+    private final SpelCalcEngine engine;
+    private final CalcDependencyValidator validator;
+
+    private final AtomicBoolean running = new AtomicBoolean(true);
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void start() {
+        Thread.ofVirtual().name("calc-engine").start(this::loop);
+        log.info("CalcEngine started (virtual thread)");
+    }
+
+    @PreDestroy
+    public void stop() {
+        running.set(false);
+    }
+
+    private void loop() {
+        while (running.get()) {
+            long nextDue = Long.MAX_VALUE;
+            try {
+                List<Tag> calcTags = tagRepository.findAll().stream()
+                        .filter(t -> t.getSourceType() == SourceType.CALC)
+                        .filter(t -> Boolean.TRUE.equals(t.getEnabled()))
+                        .filter(t -> t.getExpression() != null && !t.getExpression().isBlank())
+                        .toList();
+
+                long now = System.currentTimeMillis();
+                for (Tag tag : calcTags) {
+                    long period = tag.getRefreshPeriodMs() != null ? tag.getRefreshPeriodMs() : 1000L;
+                    if (isDue(tag, period, now)) {
+                        recalculate(tag);
+                        markCalculated(tag.getId(), now);
+                    }
+                    long due = lastCalcOrDefault(tag.getId()) + period;
+                    nextDue = Math.min(nextDue, due);
+                }
+            } catch (Exception e) {
+                log.warn("CalcEngine cycle error: {}", e.getMessage());
+            }
+
+            long sleep = Math.min(200, Math.max(10, nextDue - System.currentTimeMillis()));
+            try {
+                Thread.sleep(sleep);   // виртуальный поток — сон бесплатен
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        log.info("CalcEngine stopped");
+    }
+
+    // --- учёт времени расчёта (id -> timestamp) ---
+    private final Map<Long, Long> lastCalc = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private boolean isDue(Tag tag, long period, long now) {
+        return now >= lastCalcOrDefault(tag.getId()) + period;
+    }
+
+    private long lastCalcOrDefault(Long id) {
+        return lastCalc.getOrDefault(id, 0L);
+    }
+
+    private void markCalculated(Long id, long ts) {
+        lastCalc.put(id, ts);
+    }
+
+    // ------------------------------------------------------------------
+
+    private void recalculate(Tag tag) {
+        try {
+            List<String> refs = validator.extractRefs(tag.getExpression());
+            Map<String, Object> inputValues = new HashMap<>();
+            int worst = 0;                       // 0=Good, 1=Uncertain, 2=Bad (иерархия §5.4.7)
+
+            for (String ref : refs) {
+                var tv = tagRegistry.getTagValueByName(ref).orElse(null);
+                if (tv == null || tv.getValue() == null
+                        || tv.getQuality() == null || tv.getQuality().startsWith("Bad")) {
+                    worst = 2;
+                    break;                       // Bad среди входов — дальше не считаем
+                }
+                if (tv.getQuality().startsWith("Uncertain")) {
+                    worst = Math.max(worst, 1);  // Uncertain учитываем, но значение используем
+                }
+                inputValues.put(ref, tv.getValue());
+            }
+
+            if (worst == 2) {
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_DependencyBad", Instant.now());
+                return;
+            }
+
+            Object raw = engine.evaluate(tag.getId(), tag.getExpression(), inputValues);
+            Object result = coerce(raw, tag.getDataType());
+            if (result == null) {
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_TypeMismatch", Instant.now());
+                return;
+            }
+            // §5.4.7: Uncertain без Bad -> Uncertain (значение считается по имеющимся данным)
+            String quality = worst == 1 ? "Uncertain_DependencyUncertain" : "Good";
+            tagRegistry.updateTagValue(tag.getId(), result, quality, Instant.now());
+
+        } catch (IllegalArgumentException e) {
+            log.debug("Calc '{}' config error: {}", tag.getName(), e.getMessage());
+            tagRegistry.updateTagValue(tag.getId(), null, "Bad_Configuration", Instant.now());
+        } catch (Exception e) {
+            log.debug("Calc '{}' failed: {}", tag.getName(), e.getMessage());
+            tagRegistry.updateTagValue(tag.getId(), null, "Bad_CalculationError", Instant.now());
+        }
+    }
+
+    /** Приведение результата SpEL к типу тега. null => несоответствие. */
+    private Object coerce(Object raw, DataType type) {
+        if (raw == null) return null;
+        try {
+            return switch (type) {
+                case BOOLEAN -> raw instanceof Boolean b ? b : Boolean.parseBoolean(raw.toString());
+                case DOUBLE  -> ((Number) raw).doubleValue();
+                case FLOAT   -> ((Number) raw).floatValue();
+                case INT32   -> raw instanceof Number n ? n.intValue()
+                        : (int) Double.parseDouble(raw.toString());
+                case UINT32, INT16, UINT16 -> ((Number) raw).intValue();
+                case BYTE, SBYTE -> ((Number) raw).byteValue();
+                case STRING  -> raw.toString();
+                case DATETIME -> raw instanceof Instant i ? i : Instant.parse(raw.toString());
+                default -> raw;
+            };
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}
+============================================================
+
+package com.opcproxy.calc;
+
+/** Статические функции, доступные в формулах как #abs(..), #min(..), #max(..), #round(..), #xor(..). */
+public final class CalcFunctions {
+    private CalcFunctions() {}
+
+    public static double abs(double v)                { return Math.abs(v); }
+    public static double min(double a, double b)      { return Math.min(a, b); }
+    public static double max(double a, double b)      { return Math.max(a, b); }
+    public static double round(double v)              { return Math.round(v); }
+    public static double round(double v, int digits)  {
+        double f = Math.pow(10, digits);
+        return Math.round(v * f) / f;
+    }
+    public static boolean xor(boolean a, boolean b)   { return a ^ b; }
+}
+============================================================
+
+package com.opcproxy.calc;
+
+import java.util.Locale;
+
+/**
+ * Нормализация пользовательского синтаксиса (ТЗ §5.4.4):
+ *   AND -> and, OR -> or, NOT -> !, XOR( -> #xor(, round(x) -> #round1(x) [один аргумент],
+ *   голые имена тегов -> #ИмяТега.
+ * Вызывается перед парсингом (compile), поэтому одинаково действует
+ * в валидаторе, движке и CSV-импорте.
+ */
+public final class ExpressionNormalizer {
+    private ExpressionNormalizer() {}
+
+    public static String normalize(String expr) {
+        if (expr == null || expr.isBlank()) return expr;
+        String s = expr;
+
+        // 1. Ключевые слова (вне кавычек — упрощение: формулы со строками, содержащими AND, редки)
+        s = s.replaceAll("\\bAND\\b", "and");
+        s = s.replaceAll("\\bOR\\b", "or");
+        s = s.replaceAll("\\bNOT\\b", "!");
+        s = s.replaceAll("\\bXOR\\s*\\(", "#xor(");
+
+        // 2. round(x) с одним аргументом -> #round1(x) (аргумент без запятой до закрытия скобки)
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("round\\s*\\(([^(),]*)\\)").matcher(s);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            m.appendReplacement(sb, "#round1(" + m.group(1) + ")");
+        }
+        m.appendTail(sb);
+        s = sb.toString();
+
+        // 3. Голые идентификаторы -> #идентификатор.
+        //    Не трогаем: уже-#теги, #функции, T(...), and/or/null/true/false, имена после точки.
+        java.util.regex.Pattern ident = java.util.regex.Pattern
+                .compile("(?<![#.\\w])([A-Za-z_][A-Za-z0-9_]*)");
+        m = ident.matcher(s);
+        sb = new StringBuffer();
+        while (m.find()) {
+            String word = m.group(1);
+            String lower = word.toLowerCase(Locale.ROOT);
+            boolean keyword = lower.equals("and") || lower.equals("or")
+                    || lower.equals("t") || lower.equals("null")
+                    || lower.equals("true") || lower.equals("false")
+                    || lower.equals("new");
+            m.appendReplacement(sb, keyword ? word : "#" + word);
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+}
+============================================================
+
+package com.opcproxy.calc;
+
+import org.springframework.expression.Expression;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.TypeLocator;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Движок вычисления CALC-тегов на SpEL (ТЗ §5.4).
+ *
+ * Безопасность (ТЗ §7.2):
+ *  - T() резолвится ТОЛЬКО по белому списку классов (SpelWhitelistTypeLocator);
+ *  - конструкторы запрещены (пустой список ConstructorResolvers);
+ *  - бины (@bean) недоступны (BeanResolver не установлен);
+ *  - переменные — только имена тегов (#TagName -> значение).
+ *
+ * ВАЖНО: compile() — чистая функция без побочных эффектов. Кэширование
+ * выполняется ТОЛЬКО в evaluate(). Вложенная запись в compiledCache из
+ * computeIfAbsent() бросает ConcurrentModificationException("Recursive update").
+ */
+@Component
+public class SpelCalcEngine {
+    /** Компилированное выражение + текст формулы, по которой оно получено. */
+    private record CompiledExpression(String sourceText, Expression expression) {}
+
+
+    /** Классы, доступные из формул через T(...). */
+    private static final Set<String> ALLOWED_TYPES = Set.of(
+            "java.lang.Math",
+            "java.lang.Double",
+            "java.lang.Integer",
+            "java.lang.Long",
+            "java.lang.Boolean",
+            "java.lang.String",
+            "java.time.Duration",
+            "java.time.Instant");
+
+    private static final int MAX_EXPRESSION_LENGTH = 2000;
+
+    private final ExpressionParser parser = new SpelExpressionParser();
+    /** Кэш скомпилированных выражений: tagId -> Expression. Пишется ТОЛЬКО из evaluate(). */
+    private final Map<Long, Expression> compiledCache = new ConcurrentHashMap<>();
+    // ДОБАВИТЬ рядом — тексты формул, по которым скомпилирован кэш:
+    private final Map<Long, String> cacheSources = new ConcurrentHashMap<>();
+    /**
+     * Парсит и валидирует формулу. ЧИСТАЯ функция: не пишет в кэш.
+     * Используется и для валидации (CalcDependencyValidator/TagDialog),
+     * и внутри evaluate() после промаха кэша.
+     */
+    public Expression compile(String expression) {
+        if (expression == null || expression.isBlank()) {
+            throw new IllegalArgumentException("Формула пуста");
+        }
+        if (expression.length() > MAX_EXPRESSION_LENGTH) {
+            throw new IllegalArgumentException("Формула длиннее " + MAX_EXPRESSION_LENGTH + " символов");
+        }
+        try {
+            return parser.parseExpression(ExpressionNormalizer.normalize(expression));
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Синтаксическая ошибка в формуле: " + e.getMessage(), e);
+        }
+    }
+
+    /** Сброс кэша при изменении формулы тега (вызывать из TagService.save/delete). */
+    public void invalidate(Long tagId) {
+        compiledCache.remove(tagId);
+    }
+
+    /**
+     * Вычисляет формулу. При изменении ТЕКСТА формулы перекопилирует автоматически
+     * (защита от устаревшего кэша — аналог Excel'евского dirty-recalc).
+     */
+    public Object evaluate(Long tagId, String expression, Map<String, Object> values) {
+        // Dirty-check: перекопиляция при изменении ТЕКСТА формулы.
+        // Никаких compute/lambda — обычные get/put, конфликт типов невозможен.
+        Expression expr = compiledCache.get(tagId);
+        String cachedSrc = cacheSources.get(tagId);
+        if (expr == null || !expression.equals(cachedSrc)) {
+            expr = compile(expression);
+            compiledCache.put(tagId, expr);
+            cacheSources.put(tagId, expression);
+        }
+
+        StandardEvaluationContext ctx = new StandardEvaluationContext();
+        try {
+            ctx.registerFunction("abs",
+                    CalcFunctions.class.getMethod("abs", double.class));
+            ctx.registerFunction("min",
+                    CalcFunctions.class.getMethod("min", double.class, double.class));
+            ctx.registerFunction("max",
+                    CalcFunctions.class.getMethod("max", double.class, double.class));
+            ctx.registerFunction("round1",
+                    CalcFunctions.class.getMethod("round", double.class));
+            ctx.registerFunction("round",
+                    CalcFunctions.class.getMethod("round", double.class, int.class));
+            ctx.registerFunction("xor",
+                    CalcFunctions.class.getMethod("xor", boolean.class, boolean.class));
+        } catch (NoSuchMethodException e) {
+            throw new IllegalStateException("Calc functions registration failed", e);
+        }
+        ctx.setTypeLocator(new SpelWhitelistTypeLocator());
+        ctx.setConstructorResolvers(List.of());
+        values.forEach(ctx::setVariable);
+
+        return expr.getValue(ctx);
+    }
+
+    // ------------------------------------------------------------------
+
+    /** TypeLocator, пропускающий только классы из белого списка (ТЗ §7.2). */
+    private static class SpelWhitelistTypeLocator implements TypeLocator {
+        @Override
+        public Class<?> findType(String typeName) {
+            if (ALLOWED_TYPES.contains(typeName)) {
+                try {
+                    return Class.forName(typeName);
+                } catch (ClassNotFoundException e) {
+                    throw new IllegalArgumentException("Класс не найден: " + typeName);
+                }
+            }
+            throw new IllegalArgumentException(
+                    "Класс '" + typeName + "' не входит в белый список формул. " +
+                            "Разрешены: " + ALLOWED_TYPES);
+        }
+    }
+}
+============================================================
+
 package com.opcproxy.config;
 
 import jakarta.annotation.PostConstruct;
@@ -52,37 +574,90 @@ public class JInteropConfig {
         log.info("j-Interop configured: rpc.socketTimeout={} ms. "
                         + "NTLM signing/sealing is applied by patched JIComServer (session security).",
                 SOCKET_TIMEOUT_MS);
-        /*
-         * Включает NTLM2/session security в старом RPC-стеке JInterop.
-         */
-        System.setProperty(
-                "rpc.ntlm.ntlm2",
-                "true"
-        );
+//        /*
+//         * Включает NTLM2/session security в старом RPC-стеке JInterop.
+//         */
+//        System.setProperty(
+//                "rpc.ntlm.ntlm2",
+//                "true"
+//        );
+//
+//        /*
+//         * Включает NTLM signing.
+//         *
+//         * В NtlmConnection.java это приводит к:
+//         *
+//         * Security.PROTECTION_LEVEL_INTEGRITY
+//         */
+//        System.setProperty(
+//                "rpc.ntlm.sign",
+//                "true"
+//        );
+//
+//        /*
+//         * Не включаем шифрование без необходимости.
+//         *
+//         * Privacy сильнее Integrity, но для текущего требования
+//         * Windows достаточно уровня Packet Integrity.
+//         */
+//        System.clearProperty("rpc.ntlm.seal");
+//
+//        log.info(
+//                "JInterop configured: rpc.ntlm.ntlm2=true, rpc.ntlm.sign=true"
+//        );
+    }
+}
+============================================================
 
-        /*
-         * Включает NTLM signing.
-         *
-         * В NtlmConnection.java это приводит к:
-         *
-         * Security.PROTECTION_LEVEL_INTEGRITY
-         */
-        System.setProperty(
-                "rpc.ntlm.sign",
-                "true"
-        );
+package com.opcproxy.config;
 
-        /*
-         * Не включаем шифрование без необходимости.
-         *
-         * Privacy сильнее Integrity, но для текущего требования
-         * Windows достаточно уровня Packet Integrity.
-         */
-        System.clearProperty("rpc.ntlm.seal");
+import org.jasypt.encryption.StringEncryptor;
+import org.jasypt.iv.RandomIvGenerator;
+import org.jasypt.salt.RandomSaltGenerator;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 
-        log.info(
-                "JInterop configured: rpc.ntlm.ntlm2=true, rpc.ntlm.sign=true"
-        );
+/**
+ * Кастомный StringEncryptor для jasypt-spring-boot (ТЗ §7.3).
+ *
+ * Master-ключ берётся из:
+ *   1) переменной окружения JASYPT_MASTER_PASSWORD (основной способ),
+ *   2) либо системного свойства -Djasypt.encryptor.password=... (Run Config IDEA).
+ *
+ * ВАЖНО: master-ключ НЕ хранится в application.yml и не коммитится.
+ * Потеря ключа = невозможность расшифровать пароли подключений (пересоздать их).
+ */
+@Configuration
+public class JasyptConfig {
+
+    @Bean("jasyptStringEncryptor")
+    @Primary
+    public StringEncryptor stringEncryptor() {
+        String master = System.getenv("JASYPT_MASTER_PASSWORD");
+        if (master == null || master.isBlank()) {
+            master = System.getProperty("jasypt.encryptor.password");
+        }
+        if (master == null || master.isBlank()) {
+            throw new IllegalStateException("""
+                    JASYPT_MASTER_PASSWORD не задан.
+                    Задайте переменную окружения (Run Config -> Environment variables):
+                      JASYPT_MASTER_PASSWORD=<ваш мастер-пароль>
+                    Шифрование/расшифровка паролей подключений невозможна без ключа.""");
+        }
+
+        var encryptor = new org.jasypt.encryption.pbe.PooledPBEStringEncryptor();
+        var config = new org.jasypt.encryption.pbe.config.SimpleStringPBEConfig();
+        config.setPassword(master);
+        config.setAlgorithm("PBEWITHHMACSHA512ANDAES_256");
+        config.setKeyObtentionIterations("1000");
+        config.setPoolSize("1");
+        config.setProviderName("SunJCE");
+        config.setSaltGenerator(new RandomSaltGenerator());
+        config.setIvGenerator(new RandomIvGenerator());
+        config.setStringOutputType("base64");
+        encryptor.setConfig(config);
+        return encryptor;
     }
 }
 ============================================================
@@ -149,30 +724,34 @@ import com.opcproxy.ui.views.LoginView;
 import com.vaadin.flow.spring.security.VaadinSecurityConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetailsService;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.NoOpPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
 
-
 @Configuration
 @EnableMethodSecurity
-public class SecurityConfig{
+public class SecurityConfig {
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http)
-            throws Exception {
-
-        http.with(
-                VaadinSecurityConfigurer.vaadin(),
-                vaadinSecurity ->
-                        vaadinSecurity.loginView(LoginView.class)
-        );
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // API v1: те же пользователи, HTTP Basic (демо-стенд; прод — в бэклоге)
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/api/v1/**").authenticated()
+                        .requestMatchers("/swagger-ui/**", "/swagger-ui.html",
+                                "/v3/api-docs/**").permitAll()
+                )
+                // HTTP Basic для API (браузерный UI продолжает использовать form-login Vaadin)
+                .httpBasic(Customizer.withDefaults())
+                // Vaadin: form-login, CSRF для UI и пр.
+                .with(VaadinSecurityConfigurer.vaadin(),
+                        vaadinSecurity -> vaadinSecurity.loginView(LoginView.class));
 
         return http.build();
     }
@@ -188,13 +767,696 @@ public class SecurityConfig{
     }
 
     @Bean
+    @SuppressWarnings("deprecation")
     public PasswordEncoder passwordEncoder() {
-        // Для локальной разработки оставляем NoOp, чтобы пароль "admin" принимался как есть.
+        // Для локальной разработки: NoOp, пароль "admin" принимается как есть.
+        // БЭКЛОГ (прод): BCrypt + вынос пользователей в БД (ТЗ §7.3).
         return NoOpPasswordEncoder.getInstance();
     }
-
 }
+============================================================
 
+package com.opcproxy.csv;
+
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.DataType;
+import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.ui.services.TagService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
+import org.apache.commons.csv.CSVRecord;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+/**
+ * Импорт/экспорт тегов CSV (ТЗ §5.7).
+ * Формат: ; UTF-8; кавычки и экранирование — Apache Commons CSV.
+ * Режимы импорта: merge (update+insert) и replace (транзакционная замена).
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CsvTagService {
+    /** UTF-8 Byte Order Mark — для корректного открытия в Excel с кириллицей. */
+    private static final byte[] BOM = {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF};
+    private final TagRepository tagRepository;
+    private final TagService tagService;
+    private final OpcDaConnectionRepository connectionRepository;
+
+    /** Колонки строго по ТЗ §5.7.3. */
+    private static final String[] HEADERS = {
+            "tagName", "sourceType", "connectionName", "sourceItemId", "expression",
+            "dataType", "readMode", "refreshPeriodMs", "uaSamplingIntervalMs",
+            "intervalProfileName", "publishMqtt", "mqttDeadband", "description"
+    };
+
+    private CSVFormat format() {
+        return CSVFormat.DEFAULT.builder()
+                .setDelimiter(';')
+                .setHeader(HEADERS)
+                .setSkipHeaderRecord(true)
+                .setTrim(true)
+                .build();
+    }
+
+    // ------------------------------------------------------------------
+    // Экспорт
+    // ------------------------------------------------------------------
+
+// В format() НИЧЕГО не меняем — заголовок колонок остаётся первой распознаваемой строкой.
+// Комментарии фильтруются ВРУЧНУЮ до парсинга, т.к. Commons CSV не умеет skip-комментарии
+// при произвольном первом символе (setCommentMarker требует фиксированный символ в начале записи).
+
+    public byte[] exportAll() throws IOException {
+        List<Tag> tags = tagRepository.findAll();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(BOM);
+        try (var printer = new CSVPrinter(new OutputStreamWriter(out, StandardCharsets.UTF_8), format())) {
+            // ШАПКА (2 строки-комментария)
+            printer.printComment("OPC DA-UA Proxy — Tag Export v1");
+            printer.printComment("Generated: " + java.time.LocalDateTime.now()
+                    + "; tags: " + tags.size() + "; delimiter: ';'; encoding: UTF-8");
+            for (Tag t : tags) {
+                printer.printRecord(/* ...как было... */);
+            }
+        }
+        return out.toByteArray();
+    }
+
+    public byte[] template() throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(BOM);
+        try (var printer = new CSVPrinter(new OutputStreamWriter(out, StandardCharsets.UTF_8), format())) {
+            printer.printComment("OPC DA-UA Proxy — Tag Import Template v1");
+            printer.printComment("Строки, начинающиеся с '#', игнорируются. Разделитель: ';'.");
+
+            // --- Базовые DA ---
+            printer.printRecord("Tank1_Level",   "DA", "OPC.OpcTestServer_x86.1", "Test/Float", "", "FLOAT",   "ASYNC", 1000, "", "", false, "", "Уровень в танке (сырой тег)");
+            printer.printRecord("Tank1_Temp",    "DA", "OPC.OpcTestServer_x86.1", "Test/Int32", "", "INT32",   "ASYNC", 1000, "", "", false, "", "Температура, °C");
+            printer.printRecord("Motor_Running", "DA", "opcserversim.Instance.1", "BooleanValue", "", "BOOLEAN", "ASYNC", 500, "", "", false, "", "Двигатель работает");
+
+            // --- Арифметика ---
+            printer.printRecord("Tank1_Volume",      "CALC", "", "", "#Tank1_Level * 2.5",                        "DOUBLE", "SYNC", 1000, "", "", false, "", "Объём = уровень * коэффициент");
+            printer.printRecord("Tank1_LevelPercent","CALC", "", "", "#Tank1_Level / 100 * 100",                  "DOUBLE", "SYNC", 1000, "", "", false, "", "Процент заполнения");
+            printer.printRecord("TempFahrenheit",    "CALC", "", "", "#Tank1_Temp * 1.8 + 32",                    "DOUBLE", "SYNC", 1000, "", "", false, "", "Конвертация в °F");
+            printer.printRecord("Sum2Tags",          "CALC", "", "", "#Tank1_Level + #Tank1_Temp",                "DOUBLE", "SYNC", 1000, "", "", false, "", "Сумма двух тегов");
+
+            // --- Сравнения / уставки (результат BOOLEAN) ---
+            printer.printRecord("Tank1_HighAlarm",   "CALC", "", "", "#Tank1_Level > 80",                         "BOOLEAN","SYNC", 1000, "", "", false, "", "Верхняя уставка");
+            printer.printRecord("Tank1_LowAlarm",    "CALC", "", "", "#Tank1_Level < 20",                         "BOOLEAN","SYNC", 1000, "", "", false, "", "Нижняя уставка");
+            printer.printRecord("TempNormalRange",   "CALC", "", "", "#Tank1_Temp >= 18 and #Tank1_Temp <= 25",   "BOOLEAN","SYNC", 1000, "", "", false, "", "В норме (диапазон)");
+
+            // --- Логика ---
+            printer.printRecord("AnyAlarm",          "CALC", "", "", "#Tank1_HighAlarm or #Tank1_LowAlarm",       "BOOLEAN","SYNC", 500, "", "", false, "", "Хотя бы одна тревога");
+            printer.printRecord("AllOk",             "CALC", "", "", "#TempNormalRange and #Motor_Running",       "BOOLEAN","SYNC", 1000, "", "", false, "", "Всё в норме");
+            printer.printRecord("NotRunning",        "CALC", "", "", "not #Motor_Running",                        "BOOLEAN","SYNC", 1000, "", "", false, "", "Инверсия");
+
+            // --- Условный выбор (ternary) ---
+            printer.printRecord("LevelStatus",       "CALC", "", "", "#Tank1_Level > 80 ? 'HIGH' : (#Tank1_Level < 20 ? 'LOW' : 'OK')", "STRING", "SYNC", 1000, "", "", false, "", "Текстовый статус");
+            printer.printRecord("AlarmCode",         "CALC", "", "", "#Tank1_HighAlarm ? 1 : (#Tank1_LowAlarm ? 2 : 0)", "INT32", "SYNC", 500, "", "", false, "", "Код тревоги");
+
+            // --- Строки и конкатенация ---
+            printer.printRecord("LevelText",         "CALC", "", "", "'Level=' + #Tank1_Level",                  "STRING", "SYNC", 2000, "", "", false, "", "Конкатенация для отображения");
+
+            // --- Функции (Math, строки, cast) ---
+            printer.printRecord("TempAbs",           "CALC", "", "", "T(java.lang.Math).abs(#Tank1_Temp)",        "INT32",  "SYNC", 1000, "", "", false, "", "Модуль значения");
+            printer.printRecord("LevelRounded",      "CALC", "", "", "T(java.lang.Math).round(#Tank1_Level)",     "INT32",  "SYNC", 1000, "", "", false, "", "Округление");
+            printer.printRecord("LevelRoot",         "CALC", "", "", "T(java.lang.Math).sqrt(#Tank1_Level)",      "DOUBLE", "SYNC", 2000, "", "", false, "", "Квадратный корень");
+            printer.printRecord("LevelIntCast",      "CALC", "", "", "#Tank1_Level.intValue()",                   "INT32",  "SYNC", 1000, "", "", false, "", "Cast Double->Int");
+            printer.printRecord("MotorText",         "CALC", "", "", "#Motor_Running.toString()",                 "STRING", "SYNC", 2000, "", "", false, "", "Boolean->String");
+        }
+        return out.toByteArray();
+    }
+    /** Пропускать строки-комментарии, начинающиеся с '#'. */
+    private static boolean isComment(String firstCell) {
+        return firstCell != null && firstCell.startsWith("#");
+    }
+
+    // ------------------------------------------------------------------
+    // Импорт
+    // ------------------------------------------------------------------
+
+    public record ImportRow(int line, String tagName, String error) {
+        public boolean ok() { return error == null; }
+    }
+
+    public record ImportReport(int total, int created, int updated, List<ImportRow> errors) {
+        public boolean hasErrors() { return !errors.isEmpty(); }
+    }
+
+    /** Валидация без применения (предпросмотр). */
+    public ImportReport validate(InputStream csv) throws IOException {
+        return doImport(csv, null, false);
+    }
+
+    @Transactional
+    public ImportReport importCsv(InputStream csv, boolean replace) throws IOException {
+        return doImport(csv, replace, true);
+    }
+
+    private ImportReport doImport(InputStream csv, Boolean replace, boolean apply) throws IOException {
+        List<ImportRow> errors = new ArrayList<>();
+        List<Tag> parsed = new ArrayList<>();
+        Map<String, OpcDaConnection> connByName = new HashMap<>();
+        connectionRepository.findAll().forEach(c -> connByName.put(c.getName(), c));
+
+        int line = 1; // заголовок
+        for (CSVRecord rec : format().parse(new InputStreamReader(csv, StandardCharsets.UTF_8))) {
+            line++;
+            if (rec.size() > 0 && isComment(rec.get(0))) continue;   // шапка/комментарии
+            String tag = rec.get("tagName");
+            try {
+                Tag t = parseRow(rec, connByName);
+                parsed.add(t);
+            } catch (Exception e) {
+                errors.add(new ImportRow(line, tag, e.getMessage()));
+            }
+        }
+
+        // Дубликаты имен внутри файла
+        Set<String> seen = new HashSet<>();
+        // no-op для читаемости
+        for (Tag t : parsed) {
+            if (!seen.add(t.getName())) {
+                errors.add(new ImportRow(0, t.getName(), "Дубликат имени внутри файла"));
+            }
+        }
+
+        int created = 0, updated = 0;
+        if (apply && !errors.isEmpty()) {
+            return new ImportReport(parsed.size(), 0, 0, errors); // валидация до применения
+        }
+        if (apply) {
+            if (Boolean.TRUE.equals(replace)) {
+                for (Tag t : tagRepository.findAll()) {
+                    tagService.delete(t.getId());
+                }
+            }
+            for (Tag t : parsed) {
+                Optional<Tag> existing = tagRepository.findByName(t.getName());
+                if (existing.isPresent()) {
+                    t.setId(existing.get().getId());
+                    t.setVersion(existing.get().getVersion());
+                    tagService.save(t);   // merge
+                    updated++;
+                } else {
+                    tagService.save(t);
+                    created++;
+                }
+            }
+            log.info("CSV import: created={}, updated={}, replace={}", created, updated, replace);
+        }
+        return new ImportReport(parsed.size(), created, updated, errors);
+    }
+
+    private Tag parseRow(CSVRecord rec, Map<String, OpcDaConnection> connByName) {
+        Tag t = new Tag();
+        t.setName(require(rec, "tagName"));
+        SourceType st = SourceType.valueOf(require(rec, "sourceType").toUpperCase());
+        t.setSourceType(st);
+
+        String connName = rec.get("connectionName");
+        if (st == SourceType.DA) {
+            if (connName == null || connName.isBlank()) {
+                throw new IllegalArgumentException("Для DA-тега обязателен connectionName");
+            }
+            OpcDaConnection conn = connByName.get(connName);
+            if (conn == null) {
+                throw new IllegalArgumentException("Подключение не найдено: " + connName);
+            }
+            t.setConnection(conn);
+            t.setSourceItemId(require(rec, "sourceItemId"));
+        } else { // CALC
+            String expr = require(rec, "expression");
+            t.setExpression(expr);
+            // Валидация выражения — подключится на этапе 3 (CalcValidationService)
+        }
+
+        t.setDataType(DataType.valueOf(require(rec, "dataType").toUpperCase()));
+        String rm = rec.get("readMode");
+        t.setReadMode(rm == null || rm.isBlank() ? ReadMode.ASYNC : ReadMode.valueOf(rm.toUpperCase()));
+        t.setRefreshPeriodMs(parseInt(rec.get("refreshPeriodMs"), 1000));
+        String usi = rec.get("uaSamplingIntervalMs");
+        t.setUaSamplingIntervalMs(usi == null || usi.isBlank() ? null : Integer.parseInt(usi));
+        t.setPublishMqtt(parseBool(rec.get("publishMqtt"), false));
+        String db = rec.get("mqttDeadband");
+        t.setMqttDeadband(db == null || db.isBlank() ? null : Float.parseFloat(db));
+        t.setDescription(rec.get("description"));
+        t.setEnabled(true);
+        return t;
+    }
+
+    private static String require(CSVRecord rec, String col) {
+        String v = rec.get(col);
+        if (v == null || v.isBlank()) throw new IllegalArgumentException("Обязательное поле: " + col);
+        return v.trim();
+    }
+
+    private static Integer parseInt(String v, int def) {
+        try { return v == null || v.isBlank() ? def : Integer.parseInt(v.trim()); }
+        catch (NumberFormatException e) { throw new IllegalArgumentException("Не число: " + v); }
+    }
+
+    private static boolean parseBool(String v, boolean def) {
+        return v == null || v.isBlank() ? def
+                : v.equalsIgnoreCase("true") || v.equalsIgnoreCase("да") || v.equals("1");
+    }
+
+    private static String nvl(Object o) { return o == null ? "" : String.valueOf(o); }
+}
+============================================================
+
+package com.opcproxy.mqtt;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+@Data
+@Component
+@ConfigurationProperties(prefix = "app.mqtt")
+public class MqttProperties {
+    private boolean enabled = false;
+    private String broker = "tcp://localhost:1883";
+    private String clientId = "opc-da-ua-gateway";
+    private String baseTopic = "gateway/default";
+    private int qos = 1;
+    private boolean retain = false;
+    private long configRefreshMs = 5000;
+    /** Опциональная аутентификация (null = анонимно). */
+    private String username;
+    private String password;
+    private int bufferCapacity = 10000;
+    private long publishIntervalMs = 0;
+}
+============================================================
+
+package com.opcproxy.mqtt;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.tags.TagValueUpdatedEvent;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * MQTT-публикатор значений тегов (ТЗ §5.5).
+ *
+ * Топик:  {mqtt.base-topic}/tags/{tagName}
+ * Payload: JSON {"tag":"...","value":...,"quality":"Good","timestamp":"ISO-8601"}
+ *
+ * Публикация событийная: TagRegistry.updateTagValue() шлёт TagValueUpdatedEvent
+ * ТОЛЬКО при изменении значения/качества, поэтому дедупликация здесь не нужна.
+ * Остаются фильтры:
+ *  - тег должен иметь publishMqtt=true и быть в снапшоте конфигурации;
+ *  - числовые значения глушатся в пределах mqttDeadband;
+ *  - смена качества (в т.ч. Good<->Bad) публикуется ВСЕГДА.
+ *
+ * Переподключение: paho setAutomaticReconnect(true); конфигурация тегов
+ * перечитывается каждые mqtt.config-refresh-ms.
+ */
+@Slf4j
+@Service
+public class MqttPublisherService implements MqttCallback {
+
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ISO_INSTANT;
+    private record BufferedMessage(String topic, byte[] payload, int qos, boolean retained) {}
+    private final MqttProperties props;
+    private final TagRepository tagRepository;
+    private final ArrayBlockingQueue<BufferedMessage> outbox;
+    private final TagRegistry tagRegistry;
+    private volatile boolean running = true;
+
+    private MqttClient client;
+
+    /** Снапшот настроек публикации: tagId -> TagConf. Обновляется по расписанию. */
+    private record TagConf(String name, boolean publish, Double deadband) {}
+    private final Map<Long, TagConf> tagConfigs = new ConcurrentHashMap<>();
+
+    /** Последнее опубликованное числовое значение (для deadband): tagId -> value. */
+    private final Map<Long, Double> lastPublishedNumeric = new ConcurrentHashMap<>();
+
+    public MqttPublisherService(MqttProperties props, TagRepository tagRepository, TagRegistry tagRegistry) {
+        this.props = props;
+        this.tagRepository = tagRepository;
+        this.outbox = new java.util.concurrent.ArrayBlockingQueue<>(props.getBufferCapacity());
+        this.tagRegistry = tagRegistry;
+    }
+    @PreDestroy
+    private void initRunning(){
+        running = false;
+    }
+    // ------------------------------------------------------------------
+    // Жизненный цикл
+    // ------------------------------------------------------------------
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void start() {
+        if (!props.isEnabled()) {
+            log.info("MQTT publisher disabled (mqtt.enabled=false)");
+            return;
+        }
+        try {
+            client = new MqttClient(props.getBroker(), props.getClientId(),
+                    new MemoryPersistence());
+            client.setCallback(this);
+
+            MqttConnectOptions opts = new MqttConnectOptions();
+            opts.setAutomaticReconnect(true);
+            opts.setCleanSession(true);
+            opts.setConnectionTimeout(10);
+            if (props.getUsername() != null && !props.getUsername().isBlank()) {
+                opts.setUserName(props.getUsername());
+                opts.setPassword(props.getPassword() != null
+                        ? props.getPassword().toCharArray() : new char[0]);
+            }
+
+            client.connect(opts);
+            log.info("MQTT publisher connected to {} as '{}', base topic '{}'",
+                    props.getBroker(), props.getClientId(), props.getBaseTopic());
+        } catch (Exception e) {
+            // Не роняем старт: брокер может появиться позже, авто-реконнект подхватит
+            log.warn("MQTT broker {} unavailable ({}), automatic reconnect will retry",
+                    props.getBroker(), e.getMessage());
+        }
+        refreshTagConfigs();
+        if (props.getPublishIntervalMs() > 0) {
+            long period = props.getPublishIntervalMs();
+            Thread.ofVirtual().name("mqtt-heartbeat").start(() -> {
+                while (running) {   // добавьте volatile boolean running = true; @PreDestroy -> false
+                    try {
+                        Thread.sleep(period);
+                        heartbeat();
+                    } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                }
+            });
+            log.info("MQTT heartbeat mode: publish all every {} ms", period);
+        }
+    }
+    /** Таймерный режим: публикуем все включённые теги независимо от изменений. */
+    private void heartbeat() {
+        if (!props.isEnabled() || client == null || !client.isConnected()) return;
+        tagConfigs.forEach((tagId, conf) -> {
+            if (!conf.publish()) return;
+            try {
+                var tv = tagRegistry.getTagValue(tagId).orElse(null);
+                if (tv == null) return;
+                enqueue(new BufferedMessage(props.getBaseTopic() + "/tags/" + conf.name(),
+                        buildJson(conf.name(), tv.getValue(), tv.getQuality())
+                                .getBytes(StandardCharsets.UTF_8),
+                        props.getQos(), props.isRetain()));
+            } catch (Exception e) {
+                log.debug("MQTT heartbeat failed for {}: {}", conf.name(), e.getMessage());
+            }
+        });
+    }
+    /** Обновление снапшота настроек тегов (какие публикуем, deadband'ы). */
+    @Scheduled(fixedDelayString = "${app.mqtt.config-refresh-ms:5000}")
+    public void refreshTagConfigs() {
+        try {
+            for (Tag t : tagRepository.findAll()) {
+                // CALC-теги не публикуем, если они выключены (их значения stale)
+                if (t.getSourceType() == SourceType.CALC && !Boolean.TRUE.equals(t.getEnabled())) {
+                    continue;
+                }
+                tagConfigs.put(t.getId(), new TagConf(
+                        t.getName(),
+                        Boolean.TRUE.equals(t.getPublishMqtt()),
+                        t.getMqttDeadband() != null ? t.getMqttDeadband().doubleValue() : null));
+            }
+        } catch (Exception e) {
+            log.debug("MQTT tag-config refresh failed: {}", e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Публикация по событию (TagRegistry шлёт его только при изменении)
+    // ------------------------------------------------------------------
+
+    @EventListener
+    public void onTagValueUpdated(TagValueUpdatedEvent event) {
+        if (!props.isEnabled() || client == null || !client.isConnected()) {
+            return;
+        }
+        try {
+            Long tagId = event.getTagId();
+            TagConf conf = tagConfigs.get(tagId);
+            if (conf == null || !conf.publish()) {
+                return;
+            }
+
+            Object value = event.getValue();
+            String quality = event.getQuality() != null ? event.getQuality() : "Bad";
+
+            // --- Deadband для числовых значений (качество всегда публикуем) ---
+            if (value instanceof Number num) {
+                Double last = lastPublishedNumeric.get(tagId);
+                if (last != null && conf.deadband() != null && conf.deadband() > 0
+                        && Math.abs(num.doubleValue() - last) <= conf.deadband()) {
+                    return;   // изменение в пределах deadband — глушим
+                }
+                lastPublishedNumeric.put(tagId, num.doubleValue());
+            } else {
+                // нечисловое/null значение (в т.ч. переход в Bad) — публикуем всегда
+                lastPublishedNumeric.remove(tagId);
+            }
+            enqueue(new BufferedMessage(props.getBaseTopic() + "/tags/" + conf.name(),
+                    buildJson(conf.name(), value, quality).getBytes(StandardCharsets.UTF_8),
+                    props.getQos(), props.isRetain()));
+//            publish(conf.name(), value, quality);
+
+        } catch (Exception e) {
+            log.debug("MQTT publish failed for tag {}: {}", event.getTagId(), e.getMessage());
+        }
+    }
+    private void enqueue(BufferedMessage msg) throws Exception {
+        if (client != null && client.isConnected()) {
+            client.publish(msg.topic(), toMqtt(msg));
+            return;
+        }
+        if (!outbox.offer(msg)) {          // очередь полна — discard oldest (§5.6.6)
+            outbox.poll();
+            outbox.offer(msg);
+        }
+    }
+    private MqttMessage toMqtt(BufferedMessage m) {
+        MqttMessage mm = new MqttMessage(m.payload());
+        mm.setQos(m.qos());
+        mm.setRetained(m.retained());
+        return mm;
+    }
+    public void connectComplete(boolean reconnect, String serverURI) {
+        log.info("MQTT connected (reconnect={}) to {}", reconnect, serverURI);
+        if (!reconnect) return;            // при первом старте буфер пуст
+        int drained = 0;
+        BufferedMessage msg;
+        while ((msg = outbox.poll()) != null) {
+            try {
+                client.publish(msg.topic(), toMqtt(msg));
+                drained++;
+            } catch (Exception e) {
+                log.warn("MQTT drain failed: {}", e.getMessage());
+                break;
+            }
+        }
+        if (drained > 0) log.info("MQTT outbox drained: {} messages after reconnect", drained);
+    }
+
+
+    /** Компактный JSON без внешних зависимостей (значение — числа/строки/null, инъекция безопасна). */
+    private String buildJson(String tag, Object value, String quality) {
+        String v = value == null ? "null"
+                : value instanceof Number || value instanceof Boolean
+                ? value.toString()
+                : "\"" + value.toString()
+                .replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        return "{\"tag\":\"" + tag + "\",\"value\":" + v
+                + ",\"quality\":\"" + quality + "\""
+                + ",\"timestamp\":\"" + TS_FMT.format(Instant.now()) + "\"}";
+    }
+
+    // ------------------------------------------------------------------
+    // MqttCallback
+    // ------------------------------------------------------------------
+
+    @Override
+    public void connectionLost(Throwable cause) {
+        log.warn("MQTT connection lost: {} — automatic reconnect in progress",
+                cause != null ? cause.getMessage() : "unknown");
+    }
+
+    @Override
+    public void messageArrived(String topic, MqttMessage message) {
+        // шлюз только публикует; подписок нет
+    }
+
+    @Override
+    public void deliveryComplete(IMqttDeliveryToken token) {
+        // no-op
+    }
+}
+============================================================
+
+package com.opcproxy.opcda;
+
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.tags.TagRegistry;
+import lombok.extern.slf4j.Slf4j;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+/**
+ * Петля жизненного цикла одного подключения на виртуальном потоке.
+ *
+ * Обязанности:
+ *  - поддерживать подписку SyncAccess, пересоздавая её при изменении
+ *    набора тегов / периода (изменения через UI подхватываются без рестарта);
+ *  - health-check канала (checkAlive) каждый цикл;
+ *  - при смерти канала выйти — менеджер поднимет reconnect + новый поллер.
+ *
+ * Все блокирующие операции (DCOM-вызовы, sleep) безопасны на VT.
+ */
+@Slf4j
+public class ConnectionPoller implements Runnable {
+
+    /** Сколько циклов (по 1 с) держим подписку до проверки изменений. */
+    private static final int RESUBSCRIBE_CHECK_DIVIDER = 5;
+    private static final long CYCLE_MS = 1000;
+
+    private final OpcDaClient client;
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+    private boolean lastNoTags = true;
+
+    private volatile boolean running = true;
+    private int subscribedHash = 0;   // hash набора (itemId + period) активной подписки
+
+    public ConnectionPoller(OpcDaClient client, TagRepository tagRepository, TagRegistry tagRegistry) {
+        this.client = client;
+        this.tagRepository = tagRepository;
+        this.tagRegistry = tagRegistry;
+    }
+
+    public void stop() {
+        running = false;
+    }
+
+    @Override
+    public void run() {
+        String name = client.getConnectionConfig().getName();
+        log.info("Poller (virtual) started for '{}'", name);
+
+        int cycle = 0;
+        while (running) {
+            try {
+                if (!client.isConnected()) {
+                    log.info("'{}': connection lost, poller exits (manager will reconnect)", name);
+                    break;
+                }
+
+                List<Tag> tags = tagsOfThisConnection();
+
+                // Пересоздание подписки при изменении набора тегов/периода
+                int desiredHash = desiredHash(tags);
+                boolean needResubscribe = desiredHash != subscribedHash;
+                if (needResubscribe || (cycle % RESUBSCRIBE_CHECK_DIVIDER == 0 && !client.isSubscribed())) {
+                    long period = periodOf(tags);
+                    int n = client.subscribeAll(tags, period, this::onValue);
+                    subscribedHash = needResubscribe ? desiredHash : subscribedHash;
+                    boolean noTags = tags.isEmpty();
+                    if (noTags != lastNoTags) {           // поле private boolean lastNoTags = true;
+                        log.info("'{}': {}", name, noTags ? "no tags configured yet" : "tags found, subscribing");
+                        lastNoTags = noTags;
+                    }
+                }
+
+                // Health-check: смерть канала -> выход, менеджер поднимет заново
+                if (!client.checkAlive()) {
+                    log.warn("'{}': health check failed, poller exits", name);
+                    break;
+                }
+
+            } catch (Exception e) {
+                client.handleConnectionFailure(e);
+                log.debug("'{}': poll cycle error: {}", name, e.getMessage());
+            }
+
+            cycle++;
+            try {
+                Thread.sleep(CYCLE_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        client.stopSubscription();
+        log.info("Poller (virtual) stopped for '{}'", name);
+    }
+
+    private void onValue(Long tagId, Object value, String quality, Instant ts) {
+        tagRegistry.updateTagValue(tagId, value, quality, ts);
+    }
+
+    private List<Tag> tagsOfThisConnection() {
+        Long connId = client.getConnectionId();
+        return tagRepository.findBySourceType(SourceType.DA).stream()
+                .filter(t -> Boolean.TRUE.equals(t.getEnabled()))
+                .filter(t -> t.getConnection() != null && connId.equals(t.getConnection().getId()))
+                .filter(t -> t.getSourceItemId() != null && !t.getSourceItemId().isBlank())
+                .collect(Collectors.toList());
+    }
+
+    private long periodOf(List<Tag> tags) {
+        return tags.isEmpty()
+                ? client.getConnectionConfig().getDefaultRefreshPeriodMs()
+                : tags.stream()
+                .map(Tag::getRefreshPeriodMs)
+                .filter(Objects::nonNull)
+                .min(Integer::compare)     // самый быстрый тег задаёт период группы
+                .map(Integer::longValue)
+                .orElse(Long.valueOf(client.getConnectionConfig().getDefaultRefreshPeriodMs()));
+    }
+
+    private int desiredHash(List<Tag> tags) {
+        return Objects.hash(
+                tags.stream().map(Tag::getId).sorted().collect(Collectors.toList()),
+                periodOf(tags));
+    }
+}
 ============================================================
 
 package com.opcproxy.opcda;
@@ -211,44 +1473,89 @@ public enum ConnectionState {
 package com.opcproxy.opcda;
 
 import com.opcproxy.persistence.entity.OpcDaConnection;
-import com.opcproxy.persistence.enums.ReadMode;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import lombok.Getter;
-import org.openscada.opc.dcom.da.OPCSERVERSTATUS;
 import org.openscada.opc.lib.common.ConnectionInformation;
+import org.openscada.opc.lib.da.AccessBase;
 import org.openscada.opc.lib.da.Group;
 import org.openscada.opc.lib.da.Item;
+import org.openscada.opc.lib.da.ItemState;
 import org.openscada.opc.lib.da.Server;
+import org.openscada.opc.lib.da.SyncAccess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
+/**
+ * Клиент одного OPC DA-подключения.
+ * <p>
+ * Два режима работы:
+ * 1) Подписка (основной, ТЗ §5.2.3): subscribeAll() создает SyncAccess —
+ * Utgard сам опрашивает группу с периодом подключения и дергает callback.
+ * Один group-read за цикл вместо N поштучных DCOM-вызовов.
+ * 2) Поштучный sync-режим (резерв, ТЗ §5.2.4): addItem() + readAllSync().
+ * <p>
+ * Scheduler создается на виртуальных потоках (нужен Utgard'у для AccessBase
+ * и async-механизмов). Патчи Server/JIComServer (session security) применяются
+ * внутри патченных классов из src/main/java.
+ */
 @Getter
 public class OpcDaClient {
+    /**
+     * ItemID, которые не удалось подписать (ТЗ §5.2.8); перепроверяются по расписанию.
+     */
+    private final java.util.Set<String> notFoundItemIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
 
-    private final OpcDaConnection connectionConfig;
-    private Server server;
-    private Group group;
+    private static final Pattern CLSID_PATTERN = Pattern.compile(
+            "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$");
 
-    @Getter
-    private final Map<String, Item> items = new ConcurrentHashMap<>();
-
-    private final AtomicBoolean connected = new AtomicBoolean(false);
-    private final AtomicInteger errorCount = new AtomicInteger(0);
-    private ReadMode currentReadMode;
-    private volatile long lastDataTimestamp = System.currentTimeMillis();
-
-    public OpcDaClient(OpcDaConnection connectionConfig) {
-        this.connectionConfig = connectionConfig;
-        this.currentReadMode = connectionConfig.getDefaultReadMode();
+    /**
+     * Приёмник значения тега из подписки (реализует TagRegistry-обновление).
+     */
+    @FunctionalInterface
+    public interface TagValueSink {
+        void accept(Long tagId, Object value, String quality, Instant timestamp);
     }
 
-    private static final java.util.regex.Pattern CLSID_PATTERN = java.util.regex.Pattern.compile(
-            "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$"
-    );
+    private final OpcDaConnection connectionConfig;
+    private final Long connectionId;
+    private final PasswordCipher passwordCipher;   // <-- новое поле
+    private final TagRegistry tagRegistry;
+    private Server server;
+    private Group group;
+    private ScheduledExecutorService scheduler;
+    private volatile AccessBase access;
+
+    private final Map<String, Item> items = new ConcurrentHashMap<>();
+    private final AtomicBoolean connected = new AtomicBoolean(false);
+    private final AtomicInteger errorCount = new AtomicInteger(0);
+    private volatile long lastDataTimestamp = System.currentTimeMillis();
+
+    public OpcDaClient(OpcDaConnection connectionConfig,
+                       PasswordCipher passwordCipher, TagRegistry tagRegistry) {
+        this.connectionConfig = connectionConfig;
+        this.connectionId = connectionConfig.getId();
+        this.passwordCipher = passwordCipher;
+        this.tagRegistry = tagRegistry;
+    }
+
+    // ------------------------------------------------------------------
+    // Подключение
+    // ------------------------------------------------------------------
 
     public synchronized void connect() throws Exception {
         if (connected.get()) {
@@ -265,25 +1572,30 @@ public class OpcDaClient {
             ConnectionInformation connInfo = new ConnectionInformation();
             connInfo.setHost(connectionConfig.getHost());
             connInfo.setUser(connectionConfig.getUsername());
-            connInfo.setPassword(connectionConfig.getPasswordEncrypted());
-            // ВАЖНО: домен должен передаваться явно, иначе j-Interop не сможет
-            // корректно построить NTLM-аутентификацию
+            connInfo.setPassword(passwordCipher.decrypt(connectionConfig.getPasswordEncrypted()));
             connInfo.setDomain(connectionConfig.getDomain() != null
                     ? connectionConfig.getDomain().trim() : "");
 
             if (clsidMode) {
-                // Убираем фигурные скобки, Utgard сам их добавит
                 String clsid = rawId;
                 if (clsid.startsWith("{")) clsid = clsid.substring(1);
                 if (clsid.endsWith("}")) clsid = clsid.substring(0, clsid.length() - 1);
-                connInfo.setClsid(clsid.toUpperCase(java.util.Locale.ROOT));
+                connInfo.setClsid(clsid.toUpperCase(Locale.ROOT));
                 log.info("Using CLSID: {}", clsid);
             } else {
                 connInfo.setProgId(rawId);
-                log.info("Using ProgID: {} (требует доступа к реестру по SMB!)", rawId);
+                log.info("Using ProgID: {} (требует доступа к реестру по SMB)", rawId);
             }
 
-            server = new Server(connInfo, null);
+            // Scheduler на виртуальных потоках — обязателен для AccessBase (SyncAccess/Async20Access)
+            this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = Thread.ofVirtual()
+                        .name("utgard-sched-" + connectionConfig.getName())
+                        .unstarted(r);
+                return t;
+            });
+
+            server = new Server(connInfo, this.scheduler);
             server.connect();
             group = server.addGroup();
 
@@ -291,62 +1603,25 @@ public class OpcDaClient {
             errorCount.set(0);
             log.info("Successfully connected to OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
-            log.error("Failed to connect to OPC DA server: {}", connectionConfig.getName(), e);
+            cleanupScheduler();
             connected.set(false);
+            log.error("Failed to connect to OPC DA server: {}", connectionConfig.getName(), e);
             throw e;
         }
     }
-    /**
-     * Проверка живости канала через штатный механизм Utgard.
-     * Server.getServerState() при неудаче сам вызывает dispose() и возвращает null.
-     */
-    public boolean checkAlive() {
-        if (server == null) {
-            connected.set(false);
-            return false;
-        }
-        OPCSERVERSTATUS status = server.getServerState(); // 2.5s timeout внутри
-        if (status == null) {
-            log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
-            connected.set(false);
-            return false;
-        }
-        return true;
-    }
-    /**
-     * Реакция на ошибку уровня соединения: помечаем канал мёртвым
-     * и освобождаем сессию, чтобы checkAndReconnect поднял новую.
-     */
-    public synchronized void handleConnectionFailure(Throwable e) {
-        String msg = String.valueOf(e.getMessage());
-        boolean fatal = msg.contains("0x8001FFFF")      // j-Interop: внутренняя ошибка (мёртвый канал)
-                || msg.contains("0x80010108")            // RPC_E_DISCONNECTED
-                || msg.contains("0x800706BA")            // RPC_S_SERVER_UNAVAILABLE
-                || msg.contains("Connection reset")
-                || msg.contains("ping failed");
-        if (fatal && connected.get()) {
-            log.warn("Connection-level failure detected for {}: {} — marking lost, reconnect scheduled",
-                    connectionConfig.getName(), msg);
-            markConnectionLost();
-        }
+
+    public boolean hasNotFoundItems() {
+        return !notFoundItemIds.isEmpty();
     }
 
-    public synchronized void markConnectionLost() {
-        connected.set(false);
-        errorCount.incrementAndGet();
-        try {
-            if (server != null) {
-                server.dispose();   // форкнет destroySession в отдельном потоке
-            }
-        } catch (Exception ex) {
-            log.debug("Dispose after failure: {}", ex.getMessage());
-        }
+    public int getNotFoundCount() {
+        return notFoundItemIds.size();
     }
-
 
     public synchronized void disconnect() {
-        if (!connected.get()) return;
+        if (!connected.get() && server == null) return;
         log.info("Disconnecting from OPC DA server: {}", connectionConfig.getName());
+        stopSubscription();
         try {
             if (group != null) {
                 group.clear();
@@ -357,37 +1632,122 @@ public class OpcDaClient {
                 server = null;
             }
             items.clear();
-            connected.set(false);
+            notFoundItemIds.clear();
             log.info("Disconnected from OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
+            // 0x00001051 при shutdown — гонка с jI_ShutdownHook, штатная ситуация
             log.info("Disconnect from {} completed with cleanup note: {}",
                     connectionConfig.getName(), e.getMessage());
+        } finally {
+            cleanupScheduler();
+            connected.set(false);
         }
     }
 
+    // ------------------------------------------------------------------
+    // Подписка (основной режим)
+    // ------------------------------------------------------------------
+
     /**
-     * Добавляет тег и возвращает его. Если тег уже есть, возвращает существующий.
+     * Создает/пересоздает подписку SyncAccess на набор тегов подключения.
+     * Utgard сам опрашивает группу с периодом и вызывает sink на каждое чтение.
+     *
+     * @param tags   теги ЭТОГО подключения (enabled, с непустым sourceItemId)
+     * @param period период опроса группы, мс
+     * @param sink   приемник значений
+     * @return число реально подписанных тегов
      */
+    public synchronized int subscribeAll(Collection<Tag> tags, long periodMs, TagValueSink sink)
+            throws Exception {
+        stopSubscription();
+        if (!connected.get() || server == null) {
+            throw new IllegalStateException("Not connected: " + connectionConfig.getName());
+        }
+        if (tags.isEmpty()) {
+            return 0;
+        }
+
+        log.info("Subscribing {} tags of '{}' with period {} ms",
+                tags.size(), connectionConfig.getName(), periodMs);
+
+        SyncAccess syncAccess = new SyncAccess(server, (int) periodMs);
+        int subscribed = 0;
+        for (Tag tag : tags) {
+            String itemId = tag.getSourceItemId();
+            try {
+                final Long tagId = tag.getId();
+                syncAccess.addItem(itemId, (item, state) ->
+                        deliverValue(tagId, state, sink));
+                notFoundItemIds.remove(itemId);      // <-- ДОБАВИТЬ: подписался — снимаем метку
+                subscribed++;
+            } catch (Exception e) {
+                log.debug("Subscribe failed for item '{}' (tag '{}'): {}",
+                        itemId, tag.getName(), e.getMessage());
+                notFoundItemIds.add(itemId);          // <-- ДОБАВИТЬ
+                sink.accept(tag.getId(), null, "Bad_NotFound", Instant.now());
+            }
+        }
+        syncAccess.bind();
+        this.access = syncAccess;
+        log.info("Subscribed {} tags of '{}'", subscribed, connectionConfig.getName());
+        if (!notFoundItemIds.isEmpty()) log.warn("{} item(s) still not found on '{}'",
+                notFoundItemIds.size(), connectionConfig.getName());
+        return subscribed;
+    }
+
+    /**
+     * Останавливает активную подписку (безопасно, если её нет).
+     */
+    public synchronized void stopSubscription() {
+        AccessBase a = this.access;
+        this.access = null;
+        if (a != null) {
+            try {
+                a.unbind();
+            } catch (Exception e) {
+                log.debug("Unbind failed for {}: {}", connectionConfig.getName(), e.getMessage());
+            }
+        }
+    }
+
+    public boolean isSubscribed() {
+        return access != null;
+    }
+
+    private void deliverValue(Long tagId, ItemState state, TagValueSink sink) {
+        try {
+            Object value = OpcDaValues.unwrapVariant(state.getValue());
+            String quality = OpcDaValues.parseOpcQuality(state.getQuality());
+            if (!quality.startsWith("Good")) {
+                value = null;   // не-Good значение скрываем (ошибка №15)
+            }
+            Calendar ts = state.getTimestamp();
+            sink.accept(tagId, value, quality, ts != null ? ts.toInstant() : Instant.now());
+            lastDataTimestamp = System.currentTimeMillis();
+        } catch (Exception e) {
+            log.debug("Deliver value failed for tag {}: {}", tagId, e.getMessage());
+            sink.accept(tagId, null, "Bad_CommunicationFailure", Instant.now());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Поштучный sync-режим (резерв / тестирование)
+    // ------------------------------------------------------------------
+
     public Item addItem(String itemId) throws Exception {
         if (!connected.get() || group == null) {
             throw new IllegalStateException("Not connected to OPC DA server");
         }
-        if (items.containsKey(itemId)) {
-            return items.get(itemId);
-        }
+        Item existing = items.get(itemId);
+        if (existing != null) return existing;
         try {
             Item item = group.addItem(itemId);
             items.put(itemId, item);
-            log.debug("Added item: {} to connection: {}", itemId, connectionConfig.getName());
             return item;
         } catch (Exception e) {
-            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Обработка разрыва DCOM-сессии
-            if (e.getMessage() != null && e.getMessage().contains("0x80010108")) {
-                log.error("DCOM object disconnected (0x80010108) for {}. Marking connection as lost.", connectionConfig.getName());
-                connected.set(false); // Это триггерит логику переподключения в OpcDaConnectionManager
-            } else {
-                log.error("Failed to add item: {} to connection: {}", itemId, connectionConfig.getName(), e);
-            }
+            handleConnectionFailure(e);
+            notFoundItemIds.add(itemId);
+            log.debug("addItem failed for '{}': {}", itemId, e.getMessage());
             throw e;
         }
     }
@@ -397,26 +1757,77 @@ public class OpcDaClient {
         if (item != null && group != null) {
             try {
                 group.removeItem(itemId);
-                log.debug("Removed item: {} from connection: {}", itemId, connectionConfig.getName());
             } catch (Exception e) {
-                log.error("Failed to remove item: {} from connection: {}", itemId, connectionConfig.getName(), e);
+                log.debug("removeItem {} failed: {}", itemId, e.getMessage());
             }
         }
     }
 
-    public Map<String, Item> readAllSync() throws Exception {
-        if (!connected.get() || group == null) {
-            throw new IllegalStateException("Not connected to OPC DA server");
+    /**
+     * Разовое чтение одного item (sync-fallback).
+     */
+    public ItemState readSync(String itemId) throws Exception {
+        Item item = addItem(itemId);
+        ItemState state = item.read(false);
+        lastDataTimestamp = System.currentTimeMillis();
+        return state;
+    }
+
+    // ------------------------------------------------------------------
+    // Health / отказоустойчивость
+    // ------------------------------------------------------------------
+
+    /**
+     * Активная проверка живости канала; при обрыве Utgard сам делает dispose().
+     */
+    public boolean checkAlive() {
+        if (server == null) {
+            connected.set(false);
+            return false;
         }
         try {
-            group.read(false);
-            lastDataTimestamp = System.currentTimeMillis();
-            errorCount.set(0);
-            return items;
-        } catch (Exception e) {
-            errorCount.incrementAndGet();
-            log.error("Sync read failed for connection: {}", connectionConfig.getName(), e);
-            throw e;
+            if (server.getServerState() == null) {
+                log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
+                connected.set(false);
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            log.warn("Health check threw for {}: {}", connectionConfig.getName(), t.getMessage());
+            connected.set(false);
+            return false;
+        }
+    }
+
+    /**
+     * Реакция на ошибку уровня соединения: помечаем канал мёртвым.
+     */
+    public synchronized void handleConnectionFailure(Throwable e) {
+        String msg = String.valueOf(e.getMessage());
+        boolean fatal = msg.contains("0x8001FFFF")
+                || msg.contains("0x80010108")
+                || msg.contains("0x800706BA")
+                || msg.contains("0x800703FA")     // сервер не может перезапуститься (service)
+                || msg.contains("0x800700A4")     // threads exhausted на сервере
+                || msg.contains("Connection reset")
+                || msg.contains("ping failed");
+        if (fatal && connected.get()) {
+            log.warn("Connection-level failure for {}: {} — marking lost",
+                    connectionConfig.getName(), msg);
+            markConnectionLost();
+        }
+    }
+
+    public synchronized void markConnectionLost() {
+        connected.set(false);
+        errorCount.incrementAndGet();
+        stopSubscription();
+        try {
+            if (server != null) {
+                server.dispose();
+            }
+        } catch (Exception ex) {
+            log.debug("Dispose after failure: {}", ex.getMessage());
         }
     }
 
@@ -425,14 +1836,22 @@ public class OpcDaClient {
     }
 
     public ConnectionState getState() {
-        if (connected.get()) {
-            return ConnectionState.CONNECTED;
-        }
-        return ConnectionState.DISCONNECTED;
+        return connected.get() ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED;
     }
 
     public int getErrorCount() {
         return errorCount.get();
+    }
+
+    // ------------------------------------------------------------------
+    // Внутреннее
+    // ------------------------------------------------------------------
+
+    private void cleanupScheduler() {
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+        }
     }
 }
 ============================================================
@@ -441,6 +1860,9 @@ package com.opcproxy.opcda;
 
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -454,15 +1876,9 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Менеджер подключений к OPC DA серверам.
- *
- * Возможности:
- *  - жизненный цикл подключений (connect / disconnect / reconnect);
- *  - активный health-check живых подключений (Server.getServerState());
- *  - автоматическое переподключение упавших;
- *  - подъём подключений из БД, не сумевших подключиться при старте;
- *  - экспоненциальный backoff для недоступных серверов (5с → 10с → ... → 60с),
- *    чтобы зависший connect не блокировал health-check и поллинг остальных.
+ * Менеджер подключений. Жизненным циклом опроса теперь управляют
+ * виртуальные потоки (ConnectionPoller на каждое подключение);
+ * scheduled-задача осталась только как страховка реконнекта.
  */
 @Slf4j
 @Component
@@ -470,51 +1886,41 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OpcDaConnectionManager {
 
     private final OpcDaConnectionRepository connectionRepository;
-
-    /** Активные клиенты (ключ — ID подключения из БД). */
+    private final TagRepository tagRepository;
+    private final TagRegistry tagRegistry;
+    private final PasswordCipher passwordCipher;
     private final Map<Long, OpcDaClient> clients = new ConcurrentHashMap<>();
+    private final Map<Long, ConnectionPoller> pollers = new ConcurrentHashMap<>();
 
-    /** Время (epoch ms), раньше которого не предпринимать попыток подключения. */
     private final Map<Long, Long> nextAttemptAt = new ConcurrentHashMap<>();
-
-    /** Счётчик последовательных неудачных попыток (для backoff). */
     private final Map<Long, Integer> attemptCount = new ConcurrentHashMap<>();
-
-    /** Per-connection блокировки: connect к одному серверу не блокирует остальные. */
     private final Map<Long, Object> locks = new ConcurrentHashMap<>();
 
     private static final long RETRY_BASE_MS = 5_000;
     private static final long RETRY_MAX_MS  = 60_000;
 
     // ------------------------------------------------------------------
-    // Инициализация / завершение
+    // Жизненный цикл
     // ------------------------------------------------------------------
 
-    /**
-     * Инициализация подключений при старте приложения.
-     * Ошибки отдельных подключений не прерывают запуск остальных (изоляция отказов):
-     * упавшие попадут в цикл реконнекта с backoff.
-     */
     @EventListener(ApplicationReadyEvent.class)
     public void init() {
         log.info("Initializing OPC DA Connection Manager...");
-
         connectionRepository.findAll().stream()
                 .filter(OpcDaConnection::getEnabled)
                 .forEach(conn -> {
                     if (!tryConnect(conn)) {
-                        log.warn("Startup connect failed for '{}' — will retry in background (backoff)",
+                        log.warn("Startup connect failed for '{}' — background backoff retry",
                                 conn.getName());
                     }
                 });
-
         log.info("OPC DA Connection Manager initialized. Active connections: {}", clients.size());
     }
 
-    /** Корректное завершение всех подключений при остановке приложения. */
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down OPC DA Connection Manager...");
+        clients.keySet().forEach(this::stopPoller);
         clients.values().forEach(OpcDaClient::disconnect);
         clients.clear();
         nextAttemptAt.clear();
@@ -522,15 +1928,28 @@ public class OpcDaConnectionManager {
         locks.clear();
     }
 
+    /**
+     * ТЗ §5.2.8: теги с Bad_NotFound периодически перепроверяются.
+     * Механика: если у живого подключения есть неподписавшиеся ItemID,
+     * перезапускаем поллер — он выполнит subscribeAll() заново, и
+     * отсутствовавшие ранее ItemID получат второй шанс добавиться.
+     */
+    @Scheduled(fixedDelayString = "${app.opcda.notfound-recheck-ms:300000}")
+    public void recheckNotFoundTags() {
+        clients.forEach((id, client) -> {
+            if (client.isConnected() && client.hasNotFoundItems()) {
+                log.info("Recheck: resubscribing {} not-found items of '{}'",
+                        client.getNotFoundCount(), client.getConnectionConfig().getName());
+                stopPoller(id);
+                startPoller(id, client);
+            }
+        });
+    }
+
     // ------------------------------------------------------------------
-    // Публичный API (используется UI / REST)
+    // API
     // ------------------------------------------------------------------
 
-    /**
-     * Подключает сервер (если ещё не подключён). Потокобезопасно по id подключения.
-     *
-     * @return true, если подключение установлено (или уже было активно)
-     */
     public boolean tryConnect(OpcDaConnection connection) {
         Long id = connection.getId();
         synchronized (lockFor(id)) {
@@ -538,10 +1957,12 @@ public class OpcDaConnectionManager {
                 return true;
             }
             try {
-                OpcDaClient client = new OpcDaClient(connection);
+                OpcDaClient client = new OpcDaClient(connection, passwordCipher, tagRegistry);
+
                 client.connect();
                 clients.put(id, client);
                 clearBackoff(id);
+                startPoller(id, client);
                 log.info("Successfully connected to OPC DA server: {}", connection.getName());
                 return true;
             } catch (Exception e) {
@@ -552,9 +1973,9 @@ public class OpcDaConnectionManager {
         }
     }
 
-    /** Отключает и удаляет подключение из пула. */
     public void disconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
+            stopPoller(connectionId);
             OpcDaClient client = clients.remove(connectionId);
             if (client != null) {
                 client.disconnect();
@@ -565,22 +1986,22 @@ public class OpcDaConnectionManager {
         }
     }
 
-    /** Принудительное переподключение (UI / REST). Сбрасывает backoff. */
     public void reconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
             OpcDaClient client = clients.get(connectionId);
-            if (client != null) {
-                try {
-                    log.info("Forcing reconnect for: {}", client.getConnectionConfig().getName());
-                    client.disconnect();
-                    client.connect();
-                    clearBackoff(connectionId);
-                } catch (Exception e) {
-                    client.markConnectionLost();          // освободить сессию
-                    scheduleRetry(connectionId);
-                    log.error("Failed to reconnect to OPC DA server: {} ({})",
-                            client.getConnectionConfig().getName(), e.getMessage());
-                }
+            if (client == null) return;
+            try {
+                log.info("Forcing reconnect for: {}", client.getConnectionConfig().getName());
+                stopPoller(connectionId);
+                client.disconnect();
+                client.connect();
+                clearBackoff(connectionId);
+                startPoller(connectionId, client);
+            } catch (Exception e) {
+                client.markConnectionLost();
+                scheduleRetry(connectionId);
+                log.error("Failed to reconnect to {}: {}",
+                        client.getConnectionConfig().getName(), e.getMessage());
             }
         }
     }
@@ -594,40 +2015,25 @@ public class OpcDaConnectionManager {
     }
 
     // ------------------------------------------------------------------
-    // Фоновый цикл: health-check + реконнект с backoff
+    // Фоновая страховка реконнекта (поллеры сами держат подписки)
     // ------------------------------------------------------------------
 
-    /**
-     * Фоновая задача. Интервал — app.opcda.reconnect-check-interval-ms.
-     *
-     * 1) Для живых подключений — активный health-check (Server.getServerState();
-     *    при обрыве Utgard сам делает dispose, метод возвращает false).
-     * 2) Для мёртвых и ещё не подключённых из БД — попытка восстановления,
-     *    ограниченная экспоненциальным backoff.
-     */
     @Scheduled(fixedDelayString = "${app.opcda.reconnect-check-interval-ms:5000}")
     public void checkAndReconnect() {
-
-        // --- 1. Health-check и восстановление активных клиентов ---
+        // 1. Мёртвые клиенты из пула
         clients.forEach((id, client) -> {
-            if (client.isConnected()) {
-                if (client.checkAlive()) {
-                    return; // живо
-                }
-                log.warn("Connection '{}' is dead (health check failed), will reconnect",
-                        client.getConnectionConfig().getName());
+            if (client.isConnected() && client.checkAlive()) {
+                return; // живо, поллер работает
             }
             attemptReconnect(id);
         });
 
-        // --- 2. Подъём подключений из БД, отсутствующих в пуле ---
+        // 2. Не подключённые из БД
         connectionRepository.findAll().stream()
                 .filter(OpcDaConnection::getEnabled)
                 .filter(conn -> !clients.containsKey(conn.getId()))
                 .forEach(conn -> {
-                    if (!shouldTry(conn.getId())) {
-                        return; // backoff ещё не истёк
-                    }
+                    if (!shouldTry(conn.getId())) return;
                     if (tryConnect(conn)) {
                         log.info("Auto-reconnect successful for: {}", conn.getName());
                     } else {
@@ -638,38 +2044,50 @@ public class OpcDaConnectionManager {
     }
 
     private void attemptReconnect(Long id) {
-        if (!shouldTry(id)) {
-            return;
-        }
+        if (!shouldTry(id)) return;
         synchronized (lockFor(id)) {
             OpcDaClient client = clients.get(id);
             String name = client != null ? client.getConnectionConfig().getName() : ("id=" + id);
             try {
-                if (client != null) {
-                    client.disconnect(); // очистка (безопасна, если уже чисто)
-                }
-                // перечитываем конфиг из БД — могли изменить через UI
+                stopPoller(id);
+                if (client != null) client.disconnect();
+
                 OpcDaConnection conn = connectionRepository.findById(id).orElse(null);
                 if (conn == null || !Boolean.TRUE.equals(conn.getEnabled())) {
-                    if (client != null) {
-                        clients.remove(id);
-                    }
+                    if (client != null) clients.remove(id);
                     return;
                 }
-                OpcDaClient fresh = new OpcDaClient(conn);
+                OpcDaClient fresh = new OpcDaClient(conn, passwordCipher, tagRegistry);
                 fresh.connect();
                 clients.put(id, fresh);
                 clearBackoff(id);
+                startPoller(id, fresh);
                 log.info("Auto-reconnect successful for: {}", name);
             } catch (Exception e) {
-                if (client != null) {
-                    client.markConnectionLost();
-                }
+                if (client != null) client.markConnectionLost();
                 scheduleRetry(id);
-                log.warn("Auto-reconnect failed for {}: {} (next attempt in {} ms)",
-                        name, e.getMessage(),
+                log.warn("Auto-reconnect failed for {}: {} (next in {} ms)", name, e.getMessage(),
                         Math.max(0, nextAttemptAt.getOrDefault(id, 0L) - System.currentTimeMillis()));
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Поллеры (виртуальные потоки)
+    // ------------------------------------------------------------------
+
+    private void startPoller(Long id, OpcDaClient client) {
+        stopPoller(id);
+        ConnectionPoller poller = new ConnectionPoller(client, tagRepository, tagRegistry);
+        pollers.put(id, poller);
+        Thread.ofVirtual().name("opc-poller-" + id + "-" + client.getConnectionConfig().getName())
+                .start(poller);
+    }
+
+    private void stopPoller(Long id) {
+        ConnectionPoller poller = pollers.remove(id);
+        if (poller != null) {
+            poller.stop();
         }
     }
 
@@ -683,7 +2101,6 @@ public class OpcDaConnectionManager {
 
     private void scheduleRetry(Long id) {
         int attempts = attemptCount.merge(id, 1, Integer::sum);
-        // 5с → 10с → 20с → 40с → 60с (максимум)
         long backoff = Math.min(RETRY_MAX_MS, RETRY_BASE_MS << Math.min(attempts - 1, 10));
         nextAttemptAt.put(id, System.currentTimeMillis() + backoff);
     }
@@ -701,94 +2118,21 @@ public class OpcDaConnectionManager {
 
 package com.opcproxy.opcda;
 
-import com.opcproxy.persistence.entity.Tag;
-import com.opcproxy.persistence.enums.SourceType;
-import com.opcproxy.persistence.repository.TagRepository;
-import com.opcproxy.tags.TagRegistry;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.jinterop.dcom.core.JIUnsignedByte;
 import org.jinterop.dcom.core.JIUnsignedInteger;
 import org.jinterop.dcom.core.JIUnsignedShort;
 import org.jinterop.dcom.core.JIVariant;
-import org.openscada.opc.lib.da.Item;
-import org.openscada.opc.lib.da.ItemState;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
 
 import java.lang.reflect.Method;
-import java.time.Instant;
-import java.util.Calendar;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class TagPollingService {
+/** Конвертеры значений и качества OPC DA. Используются поллером и подписками. */
+public final class OpcDaValues {
 
-    private final OpcDaConnectionManager connectionManager;
-    private final TagRepository tagRepository;
-    private final TagRegistry tagRegistry;
+    private OpcDaValues() { }
 
-    @Scheduled(fixedDelayString = "${app.opcda.polling-interval-ms:1000}")
-    public void pollTags() {
-        List<Tag> daTags = tagRepository.findBySourceType(SourceType.DA);
-
-        for (Tag tag : daTags) {
-            if (!tag.getEnabled() || tag.getConnection() == null) continue;
-
-            Long connId = tag.getConnection().getId();
-            Optional<com.opcproxy.opcda.OpcDaClient> clientOpt = connectionManager.getClient(connId);
-
-            if (clientOpt.isEmpty() || !clientOpt.get().isConnected()) {
-                tagRegistry.updateTagValue(tag.getId(), null, "Bad_NotConnected", Instant.now());
-                continue;
-            }
-
-            com.opcproxy.opcda.OpcDaClient client = clientOpt.get();
-            String itemId = tag.getSourceItemId();
-
-            if (itemId == null || itemId.isBlank()) {
-                tagRegistry.updateTagValue(tag.getId(), null, "Bad_Configuration", Instant.now());
-                continue;
-            }
-
-            try {
-                Item item = client.addItem(itemId);
-                ItemState state = item.read(false);
-
-                // 1. Распаковка JIVariant / JIUnsigned* (исправление №8, Da Client §4.3)
-                Object rawValue = state.getValue();
-                Object cleanValue = unwrapVariant(rawValue);
-
-                // 2. Качество OPC DA: 192 = Good, 64 = Bad, 80 = Uncertain
-                String quality = parseOpcQuality(state.getQuality());
-
-                // 3. Значение при качестве != Good — null (исправление №15)
-                if (!quality.startsWith("Good")) {
-                    cleanValue = null;
-                }
-
-                Calendar calendar = state.getTimestamp();
-                Instant timestamp = calendar != null ? calendar.toInstant() : Instant.now();
-
-                tagRegistry.updateTagValue(tag.getId(), cleanValue, quality, timestamp);
-
-            } catch (Exception e) {
-                // Ошибки уровня соединения помечают канал мёртвым → реконнект через ≤5 сек
-                client.handleConnectionFailure(e);
-                log.debug("Failed to read tag {} ({}): {}", tag.getName(), itemId, e.getMessage());
-                tagRegistry.updateTagValue(tag.getId(), null, "Bad_CommunicationFailure", Instant.now());
-            }
-        }
-    }
-
-    /** Распаковка JIVariant и беззнаковых типов j-Interop в стандартные Java-типы. */
-    private Object unwrapVariant(Object raw) {
+    /** Распаковка JIVariant / JIUnsigned* в стандартные Java-типы (Da Client §4.3, ошибка №8). */
+    public static Object unwrapVariant(Object raw) {
         if (raw == null) return null;
-
         if (raw instanceof JIVariant variant) {
             try {
                 return unwrapVariant(variant.getObject());
@@ -796,11 +2140,9 @@ public class TagPollingService {
                 return raw;
             }
         }
-        if (raw instanceof JIUnsignedByte b) return b.getValue();    // 0..255
-        if (raw instanceof JIUnsignedShort s) return s.getValue();   // 0..65535
-        if (raw instanceof JIUnsignedInteger i) return i.getValue(); // 0..4294967295
-
-        // Fallback для прочих JIUnsigned* через рефлексию
+        if (raw instanceof JIUnsignedByte b) return b.getValue();
+        if (raw instanceof JIUnsignedShort s) return s.getValue();
+        if (raw instanceof JIUnsignedInteger i) return i.getValue();
         if (raw.getClass().getName().startsWith("org.jinterop.dcom.core.JIUnsigned")) {
             try {
                 Method getValue = raw.getClass().getMethod("getValue");
@@ -810,8 +2152,8 @@ public class TagPollingService {
         return raw;
     }
 
-    /** Старшие 2 бита кода качества OPC DA определяют статус. */
-    private String parseOpcQuality(int q) {
+    /** Старшие 2 бита кода качества OPC DA: 192=Good, 64=Bad, 80=Uncertain. */
+    public static String parseOpcQuality(int q) {
         int status = q & 0xC0;
         if (status == 0xC0) return "Good";
         if (status == 0x40) return "Bad";
@@ -823,8 +2165,8 @@ public class TagPollingService {
 
 package com.opcproxy.opcua;
 
+import com.opcproxy.config.OpcUaConfig;
 import com.opcproxy.persistence.entity.Tag;
-import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.persistence.repository.TagRepository;
 import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.tags.TagValueUpdatedEvent;
@@ -834,6 +2176,7 @@ import org.eclipse.milo.opcua.sdk.core.AccessLevel;
 import org.eclipse.milo.opcua.sdk.core.Reference;
 import org.eclipse.milo.opcua.sdk.server.ManagedNamespaceWithLifecycle;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
+import org.eclipse.milo.opcua.sdk.server.SessionListener;
 import org.eclipse.milo.opcua.sdk.server.items.DataItem;
 import org.eclipse.milo.opcua.sdk.server.items.MonitoredItem;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaFolderNode;
@@ -856,10 +2199,17 @@ public class AddressSpaceBuilder {
 
     private final TagRegistry tagRegistry;
     private final TagRepository tagRepository;
-    private final OpcDaConnectionRepository connectionRepository;
+    private final OpcUaConfig opcUaConfig;   // namespace URI из конфигурации
+    private final SamplingIntervalResolver samplingResolver;
+
     private volatile boolean built = false;
     private CustomNamespace namespace;
     private final Map<Long, NodeId> tagIdToNodeIdMap = new ConcurrentHashMap<>();
+
+    /** OPC UA StatusCode для Uncertain. */
+    private static final long STATUS_UNCERTAIN = 0x4000_0000L;
+    /** OPC UA StatusCode для Bad (generic). */
+    private static final long STATUS_BAD = 0x8000_0000L;
 
     public void build(OpcUaServer server) {
         if (built) {
@@ -867,17 +2217,30 @@ public class AddressSpaceBuilder {
             return;
         }
         built = true;
-        namespace = new CustomNamespace(server, "urn:opcproxy:ua");
 
+        namespace = new CustomNamespace(server, opcUaConfig.getNamespaceUri());
         namespace.startup();
 
         buildAddressSpace();
+        server.getSessionManager().addSessionListener(new SessionListener() {
+            @Override
+            public void onSessionCreated(org.eclipse.milo.opcua.sdk.server.Session session) {
+                log.info("UA session created: id={}, app='{}'",
+                        session.getSessionId(), session.getSessionName());
+            }
+
+            @Override
+            public void onSessionClosed(org.eclipse.milo.opcua.sdk.server.Session session) {
+                log.info("UA session closed: id={}, app='{}'",
+                        session.getSessionId(), session.getSessionName());
+            }
+        });
     }
 
     private void buildAddressSpace() {
         log.info("Building OPC UA Address Space...");
 
-        // 1. Создаем корневую папку "Tags"
+        // 1. Корневая папка "Tags" (плоский контур, совместимость по ТЗ §5.5.3)
         UaFolderNode tagsFolder = new UaFolderNode(
                 namespace.getNodeContext(),
                 new NodeId(namespace.getNamespaceIndex(), "Tags"),
@@ -892,7 +2255,7 @@ public class AddressSpaceBuilder {
                 false
         ));
 
-        // 2. Создаем корневую папку "Sources"
+        // 2. Корневая папка "Sources" (иерархия по подключениям)
         UaFolderNode sourcesFolder = new UaFolderNode(
                 namespace.getNodeContext(),
                 new NodeId(namespace.getNamespaceIndex(), "Sources"),
@@ -906,10 +2269,6 @@ public class AddressSpaceBuilder {
                 Identifiers.ObjectsFolder.expanded(),
                 false
         ));
-
-        log.info("Building OPC UA Address Space...");
-
-        // ... создание папок Tags и Sources без изменений ...
 
         // Загружаем теги из БД вместе с connection (fetch join — нет Lazy-прокси)
         List<Tag> tags = tagRepository.findAllEnabledWithConnection();
@@ -939,20 +2298,20 @@ public class AddressSpaceBuilder {
                 .setUserAccessLevel(EnumSet.of(AccessLevel.CurrentRead))
                 .setValue(new DataValue(new Variant(initialValue)))
                 .build();
-
+        // ТЗ §5.3: эффективный интервал тега как MinimumSamplingInterval узла.
+        // SDK Milo сам ревизует слишком быстрые запросы клиентов (см. milo#517).
+        variableNode.setMinimumSamplingInterval(samplingResolver.resolve(tag));
         namespace.getNodeManager().addNode(variableNode);
         tagIdToNodeIdMap.put(tag.getId(), nodeId);
-
-        // Ссылка из плоской папки (используем удобный метод addOrganizes)
         tagsFolder.addOrganizes(variableNode);
 
-        // Ссылка из иерархической папки
+        // Иерархия Sources/<Connection>/<Tag>
         if (tag.getConnection() != null) {
             String connName = tag.getConnection().getName();
             NodeId connFolderId = new NodeId(namespace.getNamespaceIndex(), "Sources/" + connName);
 
-            // Пытаемся найти существующую папку, если нет - создаем
-            UaFolderNode connFolder = (UaFolderNode) namespace.getNodeManager().getNode(connFolderId).orElse(null);
+            UaFolderNode connFolder =
+                    (UaFolderNode) namespace.getNodeManager().getNode(connFolderId).orElse(null);
             if (connFolder == null) {
                 connFolder = new UaFolderNode(
                         namespace.getNodeContext(),
@@ -973,9 +2332,11 @@ public class AddressSpaceBuilder {
         if (nodeId != null && namespace != null) {
             var node = (UaVariableNode) namespace.getNodeManager().getNode(nodeId).orElse(null);
             if (node != null) {
-                StatusCode statusCode = "Good".equalsIgnoreCase(event.getQuality()) ? StatusCode.GOOD : new StatusCode(0x80000000L);
+                StatusCode statusCode = statusCodeFor(event.getQuality());
                 Instant serverTime = Instant.now();
-                DateTime sourceDateTime = event.getSourceTimestamp() != null ? new DateTime(event.getSourceTimestamp()) : new DateTime(serverTime);
+                DateTime sourceDateTime = event.getSourceTimestamp() != null
+                        ? new DateTime(event.getSourceTimestamp())
+                        : new DateTime(serverTime);
 
                 DataValue dataValue = new DataValue(
                         new Variant(event.getValue()),
@@ -988,22 +2349,38 @@ public class AddressSpaceBuilder {
         }
     }
 
+    /**
+     * Маппинг качества OPC DA -> OPC UA StatusCode.
+     * Good -> GOOD, Uncertain -> 0x40000000, Bad -> 0x80000000.
+     * Не смешивать Uncertain с Bad: UA-клиенты (arOPC в т.ч.) различают их.
+     */
+    private StatusCode statusCodeFor(String quality) {
+        if (quality != null && quality.startsWith("Good")) {
+            return StatusCode.GOOD;
+        }
+        if (quality != null && quality.startsWith("Uncertain")) {
+            return new StatusCode(STATUS_UNCERTAIN);
+        }
+        return new StatusCode(STATUS_BAD);
+    }
+
     private NodeId getOpcUaDataType(String javaDataType) {
         return switch (javaDataType.toUpperCase()) {
-            case "BOOLEAN" -> Identifiers.Boolean;
-            case "INT16" -> Identifiers.Int16;
-            case "UINT16" -> Identifiers.UInt16;
-            case "INT32" -> Identifiers.Int32;
-            case "UINT32" -> Identifiers.UInt32;
-            case "FLOAT" -> Identifiers.Float;
-            case "DOUBLE" -> Identifiers.Double;
-            case "STRING" -> Identifiers.String;
+            case "BOOLEAN"  -> Identifiers.Boolean;
+            case "BYTE"     -> Identifiers.Byte;
+            case "SBYTE"    -> Identifiers.SByte;
+            case "INT16"    -> Identifiers.Int16;
+            case "UINT16"   -> Identifiers.UInt16;
+            case "INT32"    -> Identifiers.Int32;
+            case "UINT32"   -> Identifiers.UInt32;
+            case "FLOAT"    -> Identifiers.Float;
+            case "DOUBLE"   -> Identifiers.Double;
+            case "STRING"   -> Identifiers.String;
             case "DATETIME" -> Identifiers.DateTime;
-            default -> Identifiers.BaseDataType;
+            default         -> Identifiers.BaseDataType;
         };
     }
 
-    // Наследуемся от ManagedNamespaceWithLifecycle как в официальном примере ExampleNamespace.java
     private class CustomNamespace extends ManagedNamespaceWithLifecycle {
         protected CustomNamespace(OpcUaServer server, String namespaceUri) {
             super(server, namespaceUri);
@@ -1011,17 +2388,17 @@ public class AddressSpaceBuilder {
 
         @Override
         public void onDataItemsCreated(List<DataItem> dataItems) {
-            // Логика при создании подписок (можно оставить пустой для базовой реализации)
+
         }
 
         @Override
-        public void onDataItemsModified(List<DataItem> dataItems) {}
+        public void onDataItemsModified(List<DataItem> dataItems) { }
 
         @Override
-        public void onDataItemsDeleted(List<DataItem> dataItems) {}
+        public void onDataItemsDeleted(List<DataItem> dataItems) { }
 
         @Override
-        public void onMonitoringModeChanged(List<MonitoredItem> monitoredItems) {}
+        public void onMonitoringModeChanged(List<MonitoredItem> monitoredItems) { }
     }
 }
 ============================================================
@@ -1156,6 +2533,39 @@ public class OpcUaServerManager implements DisposableBean {
 }
 ============================================================
 
+package com.opcproxy.opcua;
+
+import com.opcproxy.persistence.entity.Tag;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+/**
+ * Разрешает effective sampling interval тега (ТЗ §5.3):
+ *   per-tag override (Tag.uaSamplingIntervalMs)
+ *   -> IntervalProfile.uaSamplingIntervalMs
+ *   -> app.opcua.default-sampling-interval-ms.
+ */
+@Component
+public class SamplingIntervalResolver {
+
+    @Value("${app.opcua.default-sampling-interval-ms:500}")
+    private double defaultSamplingMs;
+
+    public double resolve(Tag tag) {
+        if (tag == null) return defaultSamplingMs;
+        if (tag.getUaSamplingIntervalMs() != null && tag.getUaSamplingIntervalMs() > 0) {
+            return tag.getUaSamplingIntervalMs();
+        }
+        if (tag.getIntervalProfile() != null
+                && tag.getIntervalProfile().getUaSamplingIntervalMs() != null
+                && tag.getIntervalProfile().getUaSamplingIntervalMs() > 0) {
+            return tag.getIntervalProfile().getUaSamplingIntervalMs();
+        }
+        return defaultSamplingMs;
+    }
+}
+============================================================
+
 package com.opcproxy.persistence.entity;
 
 import jakarta.persistence.*;
@@ -1218,7 +2628,8 @@ import java.time.LocalDateTime;
 @Data
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
-@Table(name = "interval_profile")
+@Table(name = "interval_profile",
+        uniqueConstraints = @UniqueConstraint(name = "uq_interval_profile_name", columnNames = "name"))
 public class IntervalProfile {
 
     @Id
@@ -1535,6 +2946,8 @@ import java.util.Optional;
 @Repository
 public interface IntervalProfileRepository extends JpaRepository<IntervalProfile, Long> {
     Optional<IntervalProfile> findByName(String name);
+    boolean existsByName(String name);                                  // seed в сервисе
+    boolean existsByUaSamplingIntervalMs(Integer uaSamplingIntervalMs); // (опц.) диагностика дублей
 }
 ============================================================
 
@@ -1602,6 +3015,10 @@ public interface TagRepository extends JpaRepository<Tag, Long> {
     @EntityGraph(attributePaths = {"connection", "intervalProfile"})
     @Query("SELECT DISTINCT t FROM Tag t LEFT JOIN FETCH t.connection WHERE t.enabled = true")
     List<Tag> findAllEnabledWithConnection();
+
+    @Query("select (count(t) > 0) from Tag t where t.intervalProfile.id = ?1")
+    @EntityGraph(attributePaths = {"connection", "intervalProfile"})
+    boolean existsByIntervalProfileId(Long intervalProfileId);
 }
 ============================================================
 
@@ -1618,10 +3035,444 @@ public interface UserAccountRepository extends JpaRepository<UserAccount, Long> 
 }
 ============================================================
 
+package com.opcproxy.rest;
+
+import com.opcproxy.csv.CsvTagService;
+import com.opcproxy.rest.dto.RestDtos.ImportResultDto;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.nio.charset.StandardCharsets;
+
+@Tag(name = "CSV", description = "Импорт/экспорт тегов (ТЗ §5.7, §5.9)")
+@RestController
+@RequestMapping("/api/v1")
+@RequiredArgsConstructor
+public class CsvApiController {
+
+    private final CsvTagService csvTagService;
+
+    @Operation(summary = "Экспорт всех тегов в CSV")
+    @GetMapping(value = "/export/csv", produces = "text/csv;charset=UTF-8")
+    public ResponseEntity<byte[]> exportCsv() throws Exception {
+        byte[] body = csvTagService.exportAll();
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=tags-export.csv")
+                .contentType(new MediaType("text", "csv", StandardCharsets.UTF_8))
+                .body(body);
+    }
+
+    @Operation(summary = "Скачать шаблон CSV")
+    @GetMapping(value = "/export/template", produces = "text/csv;charset=UTF-8")
+    public ResponseEntity<byte[]> template() throws Exception {
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=tags-template.csv")
+                .contentType(new MediaType("text", "csv", StandardCharsets.UTF_8))
+                .body(csvTagService.template());
+    }
+
+    @Operation(summary = "Импорт CSV (multipart; mode=merge|replace)")
+    @PostMapping(value = "/import/csv", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ImportResultDto importCsv(@RequestParam("file") MultipartFile file,
+                                     @RequestParam(defaultValue = "merge") String mode) throws Exception {
+        if (file.isEmpty()) {
+            throw new IllegalArgumentException("Файл не передан");
+        }
+        if (!"merge".equals(mode) && !"replace".equals(mode)) {
+            throw new IllegalArgumentException("mode должен быть merge или replace");
+        }
+        var report = csvTagService.importCsv(file.getInputStream(), "replace".equals(mode));
+        if (report.hasErrors()) {
+            // Ошибки валидации: 422 с деталями первой ошибки (полный отчёт — в лог)
+            throw new IllegalArgumentException("Ошибки валидации: "
+                    + report.errors().get(0).line() + ": " + report.errors().get(0).error());
+        }
+        return new ImportResultDto(report.total(), report.created(), report.updated(), 0);
+    }
+}
+============================================================
+
+package com.opcproxy.rest;
+
+import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.persistence.entity.IntervalProfile;
+import com.opcproxy.rest.dto.RestDtos.ConnectionCreateRequest;
+import com.opcproxy.rest.dto.RestDtos.ConnectionDto;
+import com.opcproxy.rest.dto.RestDtos.StatusDto;
+import com.opcproxy.rest.dto.RestDtos.TagDto;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;                       // <-- entity импортом
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.ui.services.ConnectionService;
+import com.opcproxy.ui.services.IntervalProfileService;
+import com.opcproxy.ui.services.TagService;
+import io.swagger.v3.oas.annotations.Operation;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+
+@io.swagger.v3.oas.annotations.tags.Tag(                          // <-- FQ-имя аннотации
+        name = "Gateway API",
+        description = "Управление подключениями и тегами шлюза (ТЗ §5.9)")
+@RestController
+@RequestMapping("/api/v1")
+@RequiredArgsConstructor
+public class GatewayApiController {
+
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ISO_INSTANT;
+
+    private final ConnectionService connectionService;
+    private final IntervalProfileService profileService;
+    private final TagService tagService;
+    private final TagRegistry tagRegistry;
+
+    // ---------------- Status ----------------
+
+    @Operation(summary = "Сводный статус шлюза")
+    @GetMapping("/status")
+    public StatusDto status() {
+        var conns = connectionService.findAll();
+        long connected = conns.stream()
+                .filter(c -> connectionService.getStatus(c.getId()) == ConnectionState.CONNECTED)
+                .count();
+        var tags = tagService.findAll();
+        long good = tags.stream()
+                .filter(t -> tagRegistry.getTagValue(t.getId())
+                        .map(v -> v.getQuality() != null && v.getQuality().startsWith("Good"))
+                        .orElse(false))
+                .count();
+        return new StatusDto(conns.size(), (int) connected, tags.size(), (int) good,
+                "opc.tcp://Home-PC:4840");   // TODO: из конфига
+    }
+
+    // ---------------- Connections ----------------
+
+    @Operation(summary = "Список подключений со статусами")
+    @GetMapping("/connections")
+    public List<ConnectionDto> connections() {
+        return connectionService.findAll().stream()
+                .map(c -> ConnectionDto.of(c,
+                        connectionService.getStatus(c.getId()),
+                        connectionService.getErrorCount(c.getId())))
+                .toList();
+    }
+
+    @Operation(summary = "Подключение по id")
+    @GetMapping("/connections/{id}")
+    public ConnectionDto connection(@PathVariable Long id) {
+        var c = connectionService.findById(id)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Connection not found: " + id));
+        return ConnectionDto.of(c, connectionService.getStatus(id),
+                connectionService.getErrorCount(id));
+    }
+
+    @Operation(summary = "Создать подключение (пароль шифруется автоматически)")
+    @PostMapping("/connections")
+    public ResponseEntity<ConnectionDto> createConnection(@RequestBody ConnectionCreateRequest req) {
+        if (connectionService.existsByName(req.name())) {
+            throw new IllegalArgumentException("Connection name must be unique: " + req.name());
+        }
+        OpcDaConnection c = new OpcDaConnection();
+        applyToEntity(c, req);
+        c = connectionService.save(c);
+        return ResponseEntity.created(URI.create("/api/v1/connections/" + c.getId()))
+                .body(ConnectionDto.of(c, connectionService.getStatus(c.getId()),
+                        connectionService.getErrorCount(c.getId())));
+    }
+
+    @Operation(summary = "Изменить подключение")
+    @PutMapping("/connections/{id}")
+    public ConnectionDto updateConnection(@PathVariable Long id,
+                                          @RequestBody ConnectionCreateRequest req) {
+        OpcDaConnection c = connectionService.findById(id)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Connection not found: " + id));
+        applyToEntity(c, req);
+        // пароль: пусто в запросе = не менять (политика Jasypt)
+        if (req.password() == null || req.password().isBlank()) {
+            c.setPasswordEncrypted(null);   // save() подставит старое из БД
+        } else {
+            c.setPasswordEncrypted(req.password());   // plaintext -> save() зашифрует
+        }
+        c = connectionService.save(c);
+        return ConnectionDto.of(c, connectionService.getStatus(id),
+                connectionService.getErrorCount(id));
+    }
+
+    @Operation(summary = "Удалить подключение")
+    @DeleteMapping("/connections/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteConnection(@PathVariable Long id) {
+        connectionService.delete(id);
+    }
+
+    @Operation(summary = "Переподключить")
+    @PostMapping("/connections/{id}/reconnect")
+    public ConnectionDto reconnect(@PathVariable Long id) {
+        connectionService.reconnect(id);
+        var c = connectionService.findById(id)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Connection not found: " + id));
+        return ConnectionDto.of(c, connectionService.getStatus(id),
+                connectionService.getErrorCount(id));
+    }
+
+    // ---------------- Tags ----------------
+
+    @Operation(summary = "Список тегов с живыми значениями")
+    @GetMapping("/tags")
+    public List<TagDto> tags(@RequestParam(required = false) String connection) {
+        return tagService.findAll().stream()
+                .filter(t -> connection == null
+                        || (t.getConnection() != null
+                        && connection.equals(t.getConnection().getName())))
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Operation(summary = "Тег по id")
+    @GetMapping("/tags/{id}")
+    public TagDto tag(@PathVariable Long id) {
+        return tagService.findById(id)
+                .map(this::toDto)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Tag not found: " + id));
+    }
+
+    @Operation(summary = "Включить/выключить тег")
+    @PostMapping("/tags/{id}/enabled")
+    public TagDto setTagEnabled(@PathVariable Long id, @RequestParam boolean value) {
+        tagService.setEnabled(id, value);
+        return tagService.findById(id).map(this::toDto)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Tag not found: " + id));
+    }
+    @Operation(summary = "Профили интервалов OPC UA")
+    @GetMapping("/api/v1/interval-profiles")
+    public List<IntervalProfile> profiles() { return profileService.findAll(); }
+    // ---------------- Helpers ----------------
+
+    private void applyToEntity(OpcDaConnection c, ConnectionCreateRequest req) {
+        c.setName(req.name());
+        c.setHost(req.host());
+        c.setProgIdOrClsid(req.progIdOrClsid());
+        c.setUsername(req.username());
+        c.setDomain(req.domain());
+        c.setEnabled(req.enabled());
+    }
+
+    private TagDto toDto(Tag t) {          // <-- здесь Tag = entity, теперь корректно
+        var tv = tagRegistry.getTagValue(t.getId()).orElse(null);
+        return TagDto.of(t,
+                tv != null ? tv.getValue() : null,
+                tv != null ? tv.getQuality() : "Bad_NotRegistered",
+                tv != null && tv.getTimestamp() != null ? TS_FMT.format(tv.getTimestamp()) : null);
+    }
+
+}
+============================================================
+
+package com.opcproxy.rest;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+/**
+ * Единый формат ошибок API — RFC 7807 Problem Detail (ТЗ §5.9.6).
+ */
+@Slf4j
+@RestControllerAdvice(basePackages = "com.opcproxy.rest")
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ProblemDetail badRequest(IllegalArgumentException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
+        pd.setTitle("Invalid request");
+        return pd;
+    }
+
+    @ExceptionHandler(java.util.NoSuchElementException.class)
+    public ProblemDetail notFound(java.util.NoSuchElementException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND,
+                e.getMessage() != null ? e.getMessage() : "Resource not found");
+        pd.setTitle("Not found");
+        return pd;
+    }
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ProblemDetail conflict(IllegalStateException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
+        pd.setTitle("Operation not allowed");
+        return pd;
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail internal(Exception e) {
+        log.error("REST internal error", e);
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(
+                HttpStatus.INTERNAL_SERVER_ERROR, "Internal error: " + e.getMessage());
+        pd.setTitle("Internal error");
+        return pd;
+    }
+}
+============================================================
+
+package com.opcproxy.rest.dto;
+
+import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;
+
+public final class RestDtos {
+
+    private RestDtos() {}
+
+    public record ConnectionDto(Long id, String name, String host, String progIdOrClsid,
+                                String username, String domain, boolean enabled,
+                                ConnectionState state, int errorCount) {
+        public static ConnectionDto of(OpcDaConnection c, ConnectionState st, int errors) {
+            return new ConnectionDto(c.getId(), c.getName(), c.getHost(), c.getProgIdOrClsid(),
+                    c.getUsername(), c.getDomain(), Boolean.TRUE.equals(c.getEnabled()), st, errors);
+        }
+    }
+
+    public record ConnectionCreateRequest(String name, String host, String progIdOrClsid,
+                                          String username, String password, String domain,
+                                          boolean enabled) {}
+
+    public record TagDto(Long id, String name, String sourceType, String connectionName,
+                         String sourceItemId, String expression, String dataType,
+                         boolean enabled, Object value, String quality, String timestamp) {
+        public static TagDto of(Tag t, Object value, String quality, String ts) {
+            return new TagDto(t.getId(), t.getName(),
+                    t.getSourceType() != null ? t.getSourceType().name() : null,
+                    t.getConnection() != null ? t.getConnection().getName() : null,
+                    t.getSourceItemId(), t.getExpression(),
+                    t.getDataType() != null ? t.getDataType().name() : null,
+                    Boolean.TRUE.equals(t.getEnabled()), value, quality, ts);
+        }
+    }
+
+    public record StatusDto(int connectionsTotal, int connectionsConnected,
+                            int tagsTotal, int tagsGood, String opcUaEndpoint) {}
+
+    public record ImportResultDto(int total, int created, int updated, int errors) {}
+}
+============================================================
+
+package com.opcproxy.security;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.jasypt.encryption.StringEncryptor;
+import org.springframework.stereotype.Component;
+
+/**
+ * Шифрование паролей подключений (ТЗ §7.3).
+ * Формат хранения: "ENC(<base64>)". Plaintext допускается только как
+ * legacy-вход миграции и шифруется при первом чтении.
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class PasswordCipher {
+
+    public static final String PREFIX = "ENC(";
+    public static final String SUFFIX = ")";
+
+    private final StringEncryptor encryptor;   // бин "jasyptStringEncryptor"
+
+    /** Шифрует plaintext и оборачивает в ENC(...). Уже зашифрованное не трогает. */
+    public String encrypt(String plain) {
+        if (plain == null || plain.isBlank()) return plain;
+        if (isEncrypted(plain)) return plain;                  // idempotent
+        return PREFIX + encryptor.encrypt(plain) + SUFFIX;
+    }
+
+    /**
+     * Расшифровывает ENC(...) для использования DCOM-клиентом.
+     * Plaintext (legacy) возвращает как есть — с WARN в лог.
+     */
+    public String decrypt(String stored) {
+        if (stored == null || stored.isBlank()) return stored;
+        if (!isEncrypted(stored)) {
+            log.warn("decrypt: PLAINTEXT in DB (legacy) — length {}", stored.length());
+            return stored;
+        }
+        String plain = encryptor.decrypt(stored.substring(PREFIX.length(), stored.length() - SUFFIX.length()));
+        log.debug("decrypt: successfully decrypted (len={})", plain.length());   // НИКОГДА не логируем значение
+        return plain;
+    }
+
+    public boolean isEncrypted(String stored) {
+        return stored != null && stored.startsWith(PREFIX) && stored.endsWith(SUFFIX);
+    }
+
+    /** Безопасное представление для UI/логов: никогда не отдаём сам пароль. */
+    public String mask(String stored) {
+        return (stored == null || stored.isBlank()) ? "" : "••••••••(установлен)";
+    }
+}
+============================================================
+
+package com.opcproxy.security;
+
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * Разовая миграция: шифрует все plaintext-пароли подключений в ENC(...).
+ * Повторный запуск безопасен (idempotent).
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class PasswordMigrationRunner implements ApplicationRunner {
+
+    private final OpcDaConnectionRepository repository;
+    private final PasswordCipher cipher;
+
+    @Override
+    @Transactional
+    public void run(ApplicationArguments args) {
+        int migrated = 0;
+        for (var conn : repository.findAll()) {
+            String pwd = conn.getPasswordEncrypted();
+            if (pwd != null && !pwd.isBlank() && !cipher.isEncrypted(pwd)) {
+                conn.setPasswordEncrypted(cipher.encrypt(pwd));
+                repository.save(conn);
+                migrated++;
+            }
+        }
+        if (migrated > 0) {
+            log.info("Password migration: {} connections encrypted to ENC(...) format", migrated);
+        }
+    }
+}
+============================================================
+
 package com.opcproxy.tags;
 
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.persistence.repository.TagRepository;
+import lombok.Data;
+import lombok.Setter;
 import org.slf4j.Logger;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -1703,7 +3554,7 @@ public class TagRegistry {
         tagValues.remove(tagId);
         log.debug("Unregistered tag: {}", tagId);
     }
-
+    @Data
     public static class TagValue {
         private final String name;
         private volatile Object value;
@@ -1714,13 +3565,6 @@ public class TagRegistry {
             this.name = name;
         }
 
-        public String getName() { return name; }
-        public Object getValue() { return value; }
-        public void setValue(Object value) { this.value = value; }
-        public String getQuality() { return quality; }
-        public void setQuality(String quality) { this.quality = quality; }
-        public Instant getTimestamp() { return timestamp; }
-        public void setTimestamp(Instant timestamp) { this.timestamp = timestamp; }
     }
 }
 ============================================================
@@ -1757,9 +3601,7 @@ public class TagValueUpdatedEvent extends ApplicationEvent {
 
 package com.opcproxy.ui;
 
-import com.opcproxy.ui.views.ConnectionsView;
-import com.opcproxy.ui.views.DashboardView;
-import com.opcproxy.ui.views.TagsView;
+import com.opcproxy.ui.views.*;
 import com.vaadin.flow.component.applayout.AppLayout;
 import com.vaadin.flow.component.html.H1;
 import com.vaadin.flow.component.orderedlayout.FlexComponent;
@@ -1806,7 +3648,8 @@ public class MainLayout extends AppLayout implements RouterLayout {
         // nav.addItem(new SideNavItem("Tags", TagsView.class));
         // Внутри метода createDrawer() класса MainLayout.java
         nav.addItem(new SideNavItem("Tags", TagsView.class));
-
+        nav.addItem(new SideNavItem("Servers & Tags", MasterDetailView.class));
+        nav.addItem(new SideNavItem("Import/Export", ImportExportView.class));
         drawerLayout.add(nav);
         addToDrawer(drawerLayout);
     }
@@ -1820,6 +3663,8 @@ import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -1835,6 +3680,8 @@ public class ConnectionService {
 
     private final OpcDaConnectionRepository connectionRepository;
     private final OpcDaConnectionManager connectionManager;
+    private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
+    private final TagRegistry tagRegistry;
 
     public List<OpcDaConnection> findAll() {
         return connectionRepository.findAll();
@@ -1850,6 +3697,19 @@ public class ConnectionService {
 
     @Transactional
     public OpcDaConnection save(OpcDaConnection connection) {
+        // Шифруем пароль, если пользователь ввёл новый (plaintext).
+        // Зашифрованное значение (ENC(...)) не трогаем — это read-back из БД.
+        String pwd = connection.getPasswordEncrypted();
+        if (pwd != null && (pwd.contains("•") || pwd.contains("(установлен)"))) {
+            // Маска попала в entity — игнорируем, оставляем старый пароль
+            connectionRepository.findById(connection.getId())
+                    .ifPresent(old -> connection.setPasswordEncrypted(old.getPasswordEncrypted()));
+        }
+        if (connection.getPasswordEncrypted() != null
+                && !passwordCipher.isEncrypted(connection.getPasswordEncrypted())) {
+            connection.setPasswordEncrypted(
+                    passwordCipher.encrypt(connection.getPasswordEncrypted()));
+        }
         OpcDaConnection saved = connectionRepository.save(connection);
 
         if (Boolean.TRUE.equals(saved.getEnabled())) {
@@ -1871,7 +3731,19 @@ public class ConnectionService {
 
         return saved;
     }
-
+    @Transactional
+    public void setEnabled(Long id, boolean enabled) {
+        connectionRepository.findById(id).ifPresent(conn -> {
+            conn.setEnabled(enabled);
+            connectionRepository.save(conn);
+            if (enabled) {
+                connectionManager.disconnect(id);
+                connectionManager.tryConnect(conn);
+            } else {
+                connectionManager.disconnect(id);
+            }
+        });
+    }
     @Transactional
     public void delete(Long id) {
         connectionManager.disconnect(id);
@@ -1891,7 +3763,7 @@ public class ConnectionService {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection);
+        OpcDaClient testClient = new OpcDaClient(connection, passwordCipher, tagRegistry);
         try {
             testClient.connect();
             testClient.disconnect();
@@ -2027,6 +3899,96 @@ public class DashboardService {
 
 package com.opcproxy.ui.services;
 
+import com.opcproxy.persistence.entity.IntervalProfile;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
+import com.opcproxy.persistence.repository.TagRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+/**
+ * Управление профилями интервалов OPC UA (ТЗ §5.3).
+ * При старте создаёт три системных профиля, если их нет.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class IntervalProfileService {
+
+    private final IntervalProfileRepository repository;
+    private final TagRepository tagRepository;
+
+    @EventListener(ApplicationReadyEvent.class)   // PostConstruct может отработать раньше Flyway — берём ready-событие
+    @Transactional
+    public void seedDefaults() {
+        createIfAbsent("FAST_250MS", 250, "Быстрые сигналы (аварии, токовые защиты)");
+        createIfAbsent("NORMAL_1S", 1000, "Обычные технологические параметры");
+        createIfAbsent("SLOW_10S", 10000, "Медленные параметры (уровни, температуры)");
+        log.info("Interval profiles initialized: {} profiles", repository.count());
+    }
+
+    private void createIfAbsent(String name, int samplingMs, String desc) {
+        if (!repository.existsByName(name)) {
+            IntervalProfile p = new IntervalProfile();
+            p.setName(name);
+            p.setUaSamplingIntervalMs(samplingMs);
+            p.setDescription(desc);
+            repository.save(p);
+        }
+    }
+
+    public List<IntervalProfile> findAll() {
+        return repository.findAll();
+    }
+
+    public IntervalProfile findById(Long id) {
+        return repository.findById(id)
+                .orElseThrow(() -> new java.util.NoSuchElementException("Profile not found: " + id));
+    }
+
+    @Transactional
+    public IntervalProfile save(IntervalProfile p) {
+        validate(p);
+        // Уникальность имени вне БД-констрейнта — для человекочитаемой ошибки
+        repository.findByName(p.getName()).ifPresent(existing -> {
+            if (!existing.getId().equals(p.getId())) {
+                throw new IllegalArgumentException("Имя профиля уже используется: " + p.getName());
+            }
+        });
+        return repository.save(p);
+    }
+
+    @Transactional
+    public void delete(Long id) {
+        IntervalProfile p = findById(id);
+        if (tagRepository.existsByIntervalProfileId((id))) {
+            throw new IllegalStateException(
+                    "Профиль используется тегами, сначала отвяжите: " + p.getName());
+        }
+        repository.delete(p);
+    }
+
+    private void validate(IntervalProfile p) {
+        if (p.getName() == null || p.getName().isBlank())
+            throw new IllegalArgumentException("Имя профиля обязательно");
+        if (p.getUaSamplingIntervalMs() == null || p.getUaSamplingIntervalMs() < 100)
+            throw new IllegalArgumentException("Sampling interval >= 100 мс");
+        if (p.getMqttDeadband() != null && p.getMqttDeadband() < 0)
+            throw new IllegalArgumentException("MQTT deadband >= 0");
+        if (p.getMqttPublishIntervalMs() != null && p.getMqttPublishIntervalMs() < 100)
+            throw new IllegalArgumentException("MQTT publish interval >= 100 мс");
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.calc.SpelCalcEngine;
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.persistence.repository.TagRepository;
 import com.opcproxy.tags.TagRegistry;
@@ -2043,6 +4005,7 @@ public class TagService {
 
     private final TagRepository tagRepository;
     private final TagRegistry tagRegistry;
+    private final SpelCalcEngine calcEngine;   // новое поле (@RequiredArgsConstructor подхватит)
 
     public List<Tag> findAll() {
         return tagRepository.findAll();
@@ -2060,13 +4023,27 @@ public class TagService {
     public Tag save(Tag tag) {
         Tag saved = tagRepository.save(tag);
         tagRegistry.registerTag(saved);   // тег появляется в реестре сразу
+        calcEngine.invalidate(tag.getId());   // сброс кэша при любом сохранении тега
         return saved;
     }
 
     @Transactional
     public void delete(Long id) {
+        calcEngine.invalidate(id);
         tagRegistry.unregisterTag(id);
         tagRepository.deleteById(id);
+    }
+    @Transactional
+    public void setEnabled(Long id, boolean enabled) {
+        tagRepository.findById(id).ifPresent(tag -> {
+            tag.setEnabled(enabled);
+            tagRepository.save(tag);
+            if (enabled) {
+                tagRegistry.registerTag(tag);
+            } else {
+                tagRegistry.unregisterTag(id);
+            }
+        });
     }
 }
 ============================================================
@@ -2166,7 +4143,6 @@ public class ConnectionsDialog extends Dialog {
 
         binder.bind(domainField, OpcDaConnection::getDomain, OpcDaConnection::setDomain);
         binder.bind(usernameField, OpcDaConnection::getUsername, OpcDaConnection::setUsername);
-        binder.bind(passwordField, OpcDaConnection::getPasswordEncrypted, OpcDaConnection::setPasswordEncrypted);
         binder.bind(readModeBox, OpcDaConnection::getDefaultReadMode, OpcDaConnection::setDefaultReadMode);
         binder.bind(refreshPeriodField, OpcDaConnection::getDefaultRefreshPeriodMs, OpcDaConnection::setDefaultRefreshPeriodMs);
         binder.bind(reconnectIntervalField, OpcDaConnection::getReconnectIntervalMs, OpcDaConnection::setReconnectIntervalMs);
@@ -2190,6 +4166,8 @@ public class ConnectionsDialog extends Dialog {
         // Строка 3: Домен, Пользователь, Пароль
         HorizontalLayout row2 = new HorizontalLayout(domainField, usernameField, passwordField);
         row2.setWidthFull();
+        passwordField.clear();
+        passwordField.setPlaceholder("Пусто = не менять пароль");
         row2.setFlexGrow(1, domainField, usernameField, passwordField);
 
         // Строка 4: Режим, Интервалы
@@ -2236,12 +4214,20 @@ public class ConnectionsDialog extends Dialog {
         }
 
         binder.setBean(currentConnection);
+        passwordField.clear();                                  // всегда чистое поле
+        passwordField.setPlaceholder("Пусто = не менять пароль");
         setHeaderTitle(connection == null ? "Add Connection" : "Edit Connection");
         open();
     }
 
     private void save() {
         if (binder.validate().isOk()) {
+            // В save():
+            if (passwordField.getValue() == null || passwordField.getValue().isBlank()) {
+                // НЕ трогаем passwordEncrypted — save() скопирует старое из БД (логика «empty = keep»)
+            } else {
+                currentConnection.setPasswordEncrypted(passwordField.getValue());  // plaintext → save() зашифрует
+            }
             if (currentConnection.getId() == null && connectionService.existsByName(currentConnection.getName())) {
                 Notification.show("Connection name must be unique", 3000, Notification.Position.MIDDLE);
                 return;
@@ -2258,13 +4244,19 @@ public class ConnectionsDialog extends Dialog {
 
     private void testConnection() {
         if (binder.validate().isOk()) {
-            // Принудительно сохраняем значения из формы в объект перед тестом
             binder.writeBeanIfValid(currentConnection);
-            String result = connectionService.testConnection(currentConnection);
-            Notification.show(result, 4000, Notification.Position.MIDDLE);
-        } else {
-            Notification.show("Please fill required fields before testing", 2000, Notification.Position.MIDDLE);
+            // Тестируем С ТЕМ паролем, который реально будет сохранён:
+            if (passwordField.getValue() == null || passwordField.getValue().isBlank()) {
+                // пусто = тест со старым паролем из БД
+                connectionService.findById(currentConnection.getId())
+                        .ifPresent(old -> currentConnection.setPasswordEncrypted(old.getPasswordEncrypted()));
+            } else {
+                currentConnection.setPasswordEncrypted(passwordField.getValue()); // plaintext, decrypt сам разберётся
+                Notification.show("Please fill required fields before testing", 2000, Notification.Position.MIDDLE);
+            }
         }
+        String result = connectionService.testConnection(currentConnection);
+        Notification.show(result, 4000, Notification.Position.MIDDLE);
     }
 }
 ============================================================
@@ -2274,6 +4266,8 @@ package com.opcproxy.ui.views;
 import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.MainLayout;
 import com.opcproxy.ui.services.ConnectionService;
 import com.vaadin.flow.component.button.Button;
@@ -2309,10 +4303,13 @@ public class ConnectionsView extends VerticalLayout {
     private final ConnectionService connectionService;
     private final Grid<OpcDaConnection> grid = new Grid<>();
     private final ConnectionsDialog dialog;
+    private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
+    private final TagRegistry tagRegistry;
 
-    public ConnectionsView(ConnectionService connectionService) {
+    public ConnectionsView(ConnectionService connectionService, PasswordCipher passwordCipher, TagRegistry tagRegistry) {
         this.connectionService = connectionService;
         this.dialog = new ConnectionsDialog(connectionService, this::refreshGrid);
+        this.passwordCipher = passwordCipher;
 
         addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
         setWidthFull();
@@ -2322,6 +4319,7 @@ public class ConnectionsView extends VerticalLayout {
         createContextMenu();
 
         refreshGrid();
+        this.tagRegistry = tagRegistry;
     }
 
     private void createHeader() {
@@ -2472,7 +4470,7 @@ public class ConnectionsView extends VerticalLayout {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection);
+        OpcDaClient testClient = new OpcDaClient(connection,passwordCipher,tagRegistry);
         try {
             testClient.connect();
             testClient.disconnect();
@@ -2635,6 +4633,112 @@ public class DashboardView extends VerticalLayout {
 
 package com.opcproxy.ui.views;
 
+import com.opcproxy.csv.CsvTagService;
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.html.Anchor;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.radiobutton.RadioButtonGroup;
+import com.vaadin.flow.component.upload.Upload;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.server.StreamResource;
+import com.vaadin.flow.server.streams.UploadHandler;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+
+import java.io.ByteArrayInputStream;
+
+@PageTitle("Import / Export")
+@Route(value = "importexport", layout = MainLayout.class)
+@PermitAll
+public class ImportExportView extends VerticalLayout {
+
+    private final CsvTagService csvTagService;
+    private final TagService tagService;
+
+    private final RadioButtonGroup<String> mode = new RadioButtonGroup<>();
+    private String modeValue = "merge";
+
+    public ImportExportView(CsvTagService csvTagService, TagService tagService) {
+        this.csvTagService = csvTagService;
+        this.tagService = tagService;
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        add(new H2("CSV Import / Export"));
+
+        // --- Экспорт (до этапа 4 — StreamResource; заменим на REST-эндпоинт) ---
+        Anchor download = new Anchor(streamResource("tags-export.csv", this::safeExport), "");
+        download.getElement().setAttribute("download", true);
+        download.add(new Button("Export all tags",
+                e -> Notification.show("Экспорт готов — файл скачивается")));
+
+        Anchor tpl = new Anchor(streamResource("tags-template.csv", this::safeTemplate), "");
+        tpl.getElement().setAttribute("download", true);
+        Button tplBtn = new Button("Download template");   // <-- ФИКС: нет конструктора с Variant
+        tplBtn.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        tpl.add(tplBtn);
+
+        add(new HorizontalLayout(download, tpl));
+
+        // --- Режим импорта ---
+        mode.setItems("merge", "replace");
+        mode.setValue("merge");
+        mode.addValueChangeListener(e -> modeValue = e.getValue());
+        add(mode);
+
+        // --- Загрузка: новый API UploadHandler (Vaadin 24.4+/25), не deprecated ---
+        Upload upload = new Upload();
+        upload.setAcceptedFileExtensions(".csv");
+        upload.setUploadHandler((UploadHandler) ctx -> {
+            try {
+                var report = csvTagService.importCsv(ctx.getInputStream(),
+                        "replace".equals(modeValue));
+                ImportExportView.this.getUI().ifPresent(ui -> ui.access(() -> ImportExportView.this.show(report)));
+            } catch (Exception e) {
+                ImportExportView.this.getUI().ifPresent(ui -> ui.access(() ->
+                        Notification.show("Ошибка импорта: " + e.getMessage(), 5000,
+                                Notification.Position.MIDDLE)));
+            }
+        });
+        add(upload);
+    }
+
+    private void show(CsvTagService.ImportReport r) {
+        Notification.show("Total: %d, created: %d, updated: %d, errors: %d"
+                        .formatted(r.total(), r.created(), r.updated(), r.errors().size()),
+                5000, Notification.Position.MIDDLE);
+        r.errors().stream().limit(5).forEach(e ->
+                Notification.show("Строка " + e.line() + " [" + e.tagName() + "]: " + e.error(),
+                        8000, Notification.Position.MIDDLE));
+    }
+
+    /** Осознанное использование deprecated StreamResource до появления REST-эндпоинта экспорта. */
+    @SuppressWarnings("removal")
+    private StreamResource streamResource(String name, java.util.function.Supplier<byte[]> bytes) {
+        return new StreamResource(name, () -> new ByteArrayInputStream(bytes.get()));
+    }
+
+    private byte[] safeExport() {
+        try {
+            return csvTagService.exportAll();
+        } catch (Exception e) { return new byte[0];
+        }
+    }
+
+    private byte[] safeTemplate() {
+        try { return csvTagService.template(); } catch (Exception e) { return new byte[0]; }
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
 import com.vaadin.flow.component.html.H1;
 import com.vaadin.flow.component.login.LoginForm;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
@@ -2682,12 +4786,515 @@ public class LoginView extends VerticalLayout implements BeforeEnterObserver {
 
 package com.opcproxy.ui.views;
 
+import com.opcproxy.calc.CalcDependencyValidator;
+import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaClient;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.ui.services.ConnectionService;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.DetachEvent;
+import com.vaadin.flow.component.UI;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.splitlayout.SplitLayout;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.data.provider.ListDataProvider;
+import com.vaadin.flow.data.value.ValueChangeMode;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.shared.Registration;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.extern.slf4j.Slf4j;
+
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Master-Detail: слева — серверы (мастер), справа — теги выделенного сервера.
+ * Без выделения — все теги. Живые значения, фильтры, цветовая индикация.
+ *
+ * Live-обновления на poll (1 с):
+ *  - значения тегов — напрямую через span-ссылки;
+ *  - статусы серверов (мастер) — через refreshAll() (пересчёт partNameGenerator);
+ *  - качество тегов (detail) — refreshAll() только при изменении сигнатуры качеств.
+ */
+@Slf4j
+@PageTitle("Servers & Tags")
+@Route(value = "masterdetail", layout = com.opcproxy.ui.MainLayout.class)
+@PermitAll
+public class MasterDetailView extends VerticalLayout {
+
+    private static final DateTimeFormatter TS_FMT =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss");
+
+    private final ConnectionService connectionService;
+    private final TagService tagService;
+    private final TagRegistry tagRegistry;
+    private final OpcDaConnectionRepository connectionRepository;
+    private final ConnectionsDialog connectionsDialog;
+    private final TagDialog tagDialog;
+
+    private final Grid<OpcDaConnection> masterGrid = new Grid<>();
+    private final Grid<Tag> detailGrid = new Grid<>();
+
+    private final TextField serverFilter = new TextField("Server filter");
+    private final TextField tagFilter = new TextField("Tag filter");
+    private final Checkbox onlyActiveServers = new Checkbox("Active servers only");
+    private final Checkbox onlyGoodTags = new Checkbox("Good tags only");
+
+    private OpcDaConnection selectedServer;      // null = показать все теги
+    private ListDataProvider<Tag> detailProvider;
+    private ListDataProvider<OpcDaConnection> masterProvider;
+
+    private final IntervalProfileRepository profileRepository;
+    private final CalcDependencyValidator calcValidator;
+
+    private final Map<Long, Span> tagValueSpans = new ConcurrentHashMap<>();
+    private Registration pollRegistration;
+
+    /** Сигнатура качеств detail-выборки: меняем refreshAll только при изменении. */
+    private volatile int lastQualitySignature = 0;
+
+    public MasterDetailView(ConnectionService connectionService,
+                            TagService tagService,
+                            TagRegistry tagRegistry,
+                            OpcDaConnectionRepository connectionRepository,
+                            IntervalProfileRepository profileRepository,
+                            CalcDependencyValidator calcValidator) {
+        this.connectionService = connectionService;
+        this.tagService = tagService;
+        this.tagRegistry = tagRegistry;
+        this.connectionRepository = connectionRepository;
+        this.connectionsDialog = new ConnectionsDialog(connectionService, this::refreshMaster);
+        this.profileRepository = profileRepository;
+        this.calcValidator = calcValidator;
+        this.tagDialog = new TagDialog(tagService, connectionRepository,
+                calcValidator, this::refreshDetail, profileRepository);
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setSizeFull();
+
+        add(createHeader(), createFilters(), createSplit());
+        refreshMaster();
+    }
+
+    // ---------------- Header ----------------
+
+    private HorizontalLayout createHeader() {
+        H2 title = new H2("Servers & Tags");
+        Button addServer = new Button("Add Server", new Icon(VaadinIcon.PLUS_CIRCLE));
+        addServer.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addServer.addClickListener(e -> connectionsDialog.edit(null));
+
+        Button addTag = new Button("Add Tag", new Icon(VaadinIcon.PLUS));
+        addTag.addClickListener(e -> tagDialog.edit(null));
+
+        HorizontalLayout h = new HorizontalLayout(title, addServer, addTag);
+        h.setWidthFull();
+        h.setAlignItems(FlexComponent.Alignment.CENTER);
+        h.expand(title);
+        return h;
+    }
+
+    // ---------------- Filters ----------------
+
+    private HorizontalLayout createFilters() {
+        serverFilter.setPlaceholder("Name / host / ProgID / CLSID…");
+        serverFilter.setClearButtonVisible(true);
+        serverFilter.setValueChangeMode(ValueChangeMode.LAZY);
+        serverFilter.addValueChangeListener(e -> masterGrid.getDataProvider().refreshAll());
+
+        tagFilter.setPlaceholder("Tag name / ItemID…");
+        tagFilter.setClearButtonVisible(true);
+        tagFilter.setValueChangeMode(ValueChangeMode.LAZY);
+        tagFilter.addValueChangeListener(e -> detailGrid.getDataProvider().refreshAll());
+
+        onlyActiveServers.addValueChangeListener(e -> masterGrid.getDataProvider().refreshAll());
+        onlyGoodTags.addValueChangeListener(e -> {
+            lastQualitySignature = 0;   // форс-пересчёт при смене фильтра
+            detailGrid.getDataProvider().refreshAll();
+        });
+
+        HorizontalLayout h = new HorizontalLayout(serverFilter, tagFilter,
+                onlyActiveServers, onlyGoodTags);
+        h.setWidthFull();
+        h.setAlignItems(FlexComponent.Alignment.END);
+        return h;
+    }
+
+    // ---------------- Master / Detail ----------------
+
+    private SplitLayout createSplit() {
+        buildMasterGrid();
+        buildDetailGrid();
+
+        VerticalLayout masterPanel = new VerticalLayout(new H2("Servers"), masterGrid);
+        masterPanel.setSizeFull();
+        masterPanel.setPadding(false);
+
+        VerticalLayout detailPanel = new VerticalLayout(new H2("Tags"), detailGrid);
+        detailPanel.setSizeFull();
+        detailPanel.setPadding(false);
+
+        SplitLayout split = new SplitLayout(masterPanel, detailPanel);
+        split.setSizeFull();
+        split.setSplitterPosition(45);
+        return split;
+    }
+
+    private void buildMasterGrid() {
+        masterGrid.setSizeFull();
+        masterGrid.setSelectionMode(Grid.SelectionMode.SINGLE);
+
+        masterGrid.addColumn(OpcDaConnection::getName)
+                .setHeader("Name").setFlexGrow(2).setSortable(true);
+        masterGrid.addColumn(OpcDaConnection::getHost)
+                .setHeader("Host").setFlexGrow(1);
+        masterGrid.addComponentColumn(this::statusBadge)
+                .setHeader("Status").setFlexGrow(1);
+        masterGrid.addComponentColumn(this::tagCountBadge)
+                .setHeader("Tags Good/Total").setFlexGrow(1);
+        masterGrid.addComponentColumn(this::serverActions)
+                .setHeader("Actions").setFlexGrow(0).setWidth("170px");
+
+        // Part-имя строки вынесено в отдельный метод с явным типом
+        masterGrid.setPartNameGenerator(this::masterRowClass);
+
+        // Выделение сервера → фильтруем детали
+        masterGrid.addSelectionListener(e ->
+                e.getFirstSelectedItem().ifPresentOrElse(
+                        this::selectServer,
+                        this::clearServerSelection));
+    }
+
+    /**
+     * Part-имя строки мастера: красная — сервер недоступен (не подключён
+     * или выключен), нейтральная — подключён.
+     * Вызывается Grid'ом при каждом refreshAll(), поэтому на poll-е
+     * строка перекрашивается автоматически.
+     */
+    private String masterRowClass(OpcDaConnection conn) {
+        boolean enabled = Boolean.TRUE.equals(conn.getEnabled());
+        ConnectionState state = connectionService.getStatus(conn.getId());
+        boolean connected = enabled && state == ConnectionState.CONNECTED;
+        return connected ? null : "row-error";
+    }
+
+    /**
+     * Part-имя строки detail-таблицы: красная — Bad, жёлтая — Uncertain.
+     * null = без подсветки.
+     */
+    private String detailRowClass(Tag tag) {
+        String q = qualityOf(tag);
+        if (q.startsWith("Bad")) {
+            return "row-error";
+        }
+        if (q.startsWith("Uncertain")) {
+            return "row-warning";
+        }
+        return null;
+    }
+
+    private void buildDetailGrid() {
+        detailGrid.setSizeFull();
+
+        detailGrid.addColumn(Tag::getName)
+                .setHeader("Tag").setFlexGrow(2).setSortable(true);
+        detailGrid.addColumn(this::connectionNameOf)
+                .setHeader("Server").setFlexGrow(1);
+        detailGrid.addColumn(Tag::getSourceItemId)
+                .setHeader("ItemID").setFlexGrow(2);
+        detailGrid.addComponentColumn(this::tagValueSpan)
+                .setHeader("Value").setFlexGrow(1);
+        detailGrid.addComponentColumn(this::qualityBadge)
+                .setHeader("Quality").setFlexGrow(1);
+        detailGrid.addComponentColumn(this::tagActions)
+                .setHeader("Actions").setFlexGrow(0).setWidth("110px");
+
+        detailGrid.setPartNameGenerator(this::detailRowClass);
+
+        detailProvider = new ListDataProvider<>(List.of());
+        detailGrid.setDataProvider(detailProvider);
+    }
+
+    // ---------------- Selection ----------------
+
+    private void selectServer(OpcDaConnection conn) {
+        selectedServer = conn;
+        refreshDetail();
+    }
+
+    private void clearServerSelection() {
+        selectedServer = null;
+        refreshDetail();
+    }
+
+    private List<Tag> currentTags() {
+        List<Tag> tags = tagService.findAll();
+        if (selectedServer != null) {
+            tags = tags.stream()
+                    .filter(t -> t.getConnection() != null
+                            && selectedServer.getId().equals(t.getConnection().getId()))
+                    .collect(Collectors.toList());
+        }
+        return tags;
+    }
+
+    private String connectionNameOf(Tag tag) {
+        return tag.getConnection() != null ? tag.getConnection().getName() : "—";
+    }
+
+    // ---------------- Refresh ----------------
+
+    private void refreshMaster() {
+        List<OpcDaConnection> all = connectionService.findAll();
+
+        boolean onlyActive = onlyActiveServers.getValue();
+        String f = serverFilter.getValue() == null ? "" : serverFilter.getValue().toLowerCase();
+
+        List<OpcDaConnection> filtered = all.stream()
+                .filter(c -> !onlyActive || Boolean.TRUE.equals(c.getEnabled()))
+                .filter(c -> f.isEmpty()
+                        || contains(c.getName(), f)
+                        || contains(c.getHost(), f)
+                        || contains(c.getProgIdOrClsid(), f))
+                .collect(Collectors.toList());
+
+        masterProvider = new ListDataProvider<>(filtered);
+        masterGrid.setDataProvider(masterProvider);
+
+        // если выделенный сервер пропал из фильтра — сброс
+        if (selectedServer != null && filtered.stream()
+                .noneMatch(c -> c.getId().equals(selectedServer.getId()))) {
+            masterGrid.deselectAll(); // вызовет clearServerSelection
+        }
+    }
+
+    private void refreshDetail() {
+        tagValueSpans.clear();
+        lastQualitySignature = 0;   // форс-пересчёт подписки quality на следующем poll-е
+
+        String f = tagFilter.getValue() == null ? "" : tagFilter.getValue().toLowerCase();
+        boolean onlyGood = onlyGoodTags.getValue();
+
+        List<Tag> filtered = currentTags().stream()
+                .filter(t -> f.isEmpty()
+                        || contains(t.getName(), f)
+                        || contains(t.getSourceItemId(), f))
+                .filter(t -> !onlyGood || qualityOf(t).startsWith("Good"))
+                .collect(Collectors.toList());
+
+        detailProvider = new ListDataProvider<>(filtered);
+        detailGrid.setDataProvider(detailProvider);
+    }
+
+    private static boolean contains(String s, String lower) {
+        return s != null && s.toLowerCase().contains(lower);
+    }
+
+    // ---------------- Badges / colors ----------------
+
+    private String qualityOf(Tag tag) {
+        return tagRegistry.getTagValue(tag.getId())
+                .map(TagRegistry.TagValue::getQuality).orElse("Bad_NotRegistered");
+    }
+
+    private Span statusBadge(OpcDaConnection conn) {
+        boolean enabled = Boolean.TRUE.equals(conn.getEnabled());
+        ConnectionState st = connectionService.getStatus(conn.getId());
+        String text = !enabled ? "DISABLED"
+                : st == ConnectionState.CONNECTED ? "CONNECTED" : st.name();
+        Span s = new Span(text);
+        s.addClassNames(LumoUtility.Padding.Horizontal.SMALL, LumoUtility.FontSize.XSMALL,
+                LumoUtility.FontWeight.BOLD, LumoUtility.BorderRadius.MEDIUM);
+        String color = !enabled || st != ConnectionState.CONNECTED
+                ? "var(--lumo-error-color)" : "var(--lumo-success-color)";
+        s.getStyle().set("color", color);
+        return s;
+    }
+
+    private Span tagCountBadge(OpcDaConnection conn) {
+        List<Tag> tags = tagService.findAll().stream()
+                .filter(t -> t.getConnection() != null
+                        && conn.getId().equals(t.getConnection().getId()))
+                .toList();
+        long good = tags.stream().filter(t -> qualityOf(t).startsWith("Good")).count();
+        Span s = new Span(good + "/" + tags.size());
+        s.addClassNames(LumoUtility.FontSize.XSMALL);
+        s.getStyle().set("color", good == tags.size() && !tags.isEmpty()
+                ? "var(--lumo-success-color)" : "var(--lumo-warning-color)");
+        return s;
+    }
+
+    private Span tagValueSpan(Tag tag) {
+        Span span = new Span("—");
+        span.addClassNames(LumoUtility.FontSize.SMALL);
+        tagValueSpans.put(tag.getId(), span);
+        applyValue(tag.getId());
+        return span;
+    }
+
+    private void applyValue(Long tagId) {
+        Span span = tagValueSpans.get(tagId);
+        if (span == null) return;
+        var tv = tagRegistry.getTagValue(tagId).orElse(null);
+        Object v = tv != null ? tv.getValue() : null;
+        String q = tv != null ? tv.getQuality() : "Bad";
+        span.setText(v != null ? String.valueOf(v) : "—");
+        span.getStyle().set("color", colorForQuality(q));
+        if (tv != null && tv.getTimestamp() != null) {
+            span.getElement().setProperty("title", "Updated: "
+                    + TS_FMT.format(tv.getTimestamp().atZone(ZoneId.systemDefault())));
+        }
+    }
+
+    private String colorForQuality(String q) {
+        if (q.startsWith("Good")) return "var(--lumo-success-color)";
+        if (q.startsWith("Uncertain")) return "var(--lumo-warning-color)";
+        return "var(--lumo-error-color)";
+    }
+
+    private Span qualityBadge(Tag tag) {
+        String q = qualityOf(tag);
+        Span s = new Span(q);
+        s.addClassNames(LumoUtility.Padding.Horizontal.SMALL, LumoUtility.FontSize.XSMALL,
+                LumoUtility.FontWeight.BOLD, LumoUtility.BorderRadius.MEDIUM);
+        s.getStyle().set("color", colorForQuality(q));
+        return s;
+    }
+
+    // ---------------- Actions ----------------
+
+    private HorizontalLayout serverActions(OpcDaConnection conn) {
+        boolean enabled = Boolean.TRUE.equals(conn.getEnabled());
+
+        Button toggle = new Button(enabled ? "Disable" : "Enable");
+        toggle.addThemeVariants(ButtonVariant.LUMO_SMALL,
+                enabled ? ButtonVariant.LUMO_ERROR : ButtonVariant.LUMO_SUCCESS);
+        toggle.addClickListener(e -> {
+            connectionService.setEnabled(conn.getId(), !enabled);
+            refreshMaster();
+        });
+
+        Button edit = new Button(new Icon(VaadinIcon.EDIT));
+        edit.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+        edit.addClickListener(e -> connectionsDialog.edit(
+                connectionService.findById(conn.getId()).orElse(null)));
+
+        Button reconnect = new Button(new Icon(VaadinIcon.REFRESH));
+        reconnect.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+        reconnect.addClickListener(e -> {
+            connectionService.reconnect(conn.getId());
+            refreshMaster();
+        });
+
+        HorizontalLayout h = new HorizontalLayout(toggle, edit, reconnect);
+        h.setSpacing(false);
+        h.setJustifyContentMode(FlexComponent.JustifyContentMode.CENTER);
+        return h;
+    }
+
+    private HorizontalLayout tagActions(Tag tag) {
+        boolean enabled = Boolean.TRUE.equals(tag.getEnabled());
+
+        Button toggle = new Button(enabled ? "Disable" : "Enable");
+        toggle.addThemeVariants(ButtonVariant.LUMO_SMALL,
+                enabled ? ButtonVariant.LUMO_ERROR : ButtonVariant.LUMO_SUCCESS);
+        toggle.addClickListener(e -> {
+            tagService.setEnabled(tag.getId(), !enabled);
+            refreshDetail();
+            refreshMaster(); // счётчик тегов тоже меняется
+        });
+
+        Button edit = new Button(new Icon(VaadinIcon.EDIT));
+        edit.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+        edit.addClickListener(e -> tagService.findById(tag.getId())
+                .ifPresentOrElse(tagDialog::edit,
+                        () -> Notification.show("Tag not found", 2000, Notification.Position.MIDDLE)));
+
+        HorizontalLayout h = new HorizontalLayout(toggle, edit);
+        h.setSpacing(false);
+        h.setJustifyContentMode(FlexComponent.JustifyContentMode.CENTER);
+        return h;
+    }
+
+    // ---------------- Quality signature (для умного refresh) ----------------
+
+    /** Сумма хэшей (tagId + quality) — меняется при любом изменении качества видимых тегов. */
+    private int qualitySignature() {
+        return currentTags().stream()
+                .mapToInt(t -> Objects.hash(t.getId(), qualityOf(t)))
+                .reduce(0, Integer::sum);
+    }
+
+    // ---------------- Live updates ----------------
+
+    @Override
+    protected void onAttach(AttachEvent event) {
+        super.onAttach(event);
+        UI ui = event.getUI();
+        ui.setPollInterval(1000);
+        pollRegistration = ui.addPollListener(e -> {
+            // 1. Значения — напрямую (без пересборки строк)
+            tagValueSpans.keySet().forEach(this::applyValue);
+
+            // 2. Quality-бейджи и подсветка строк detail — только при изменении качества
+            int sig = qualitySignature();
+            if (sig != lastQualitySignature) {
+                lastQualitySignature = sig;
+                detailGrid.getDataProvider().refreshAll();   // пересчитывает detailRowClass + бейджи
+            }
+
+            // 3. Статусы серверов (мастер) — пересчёт masterRowClass
+            masterGrid.getDataProvider().refreshAll();
+        });
+    }
+
+    @Override
+    protected void onDetach(DetachEvent event) {
+        if (pollRegistration != null) {
+            pollRegistration.remove();
+            pollRegistration = null;
+        }
+        event.getUI().setPollInterval(-1);
+        super.onDetach(event);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.calc.CalcDependencyValidator;
+import com.opcproxy.persistence.entity.IntervalProfile;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.persistence.enums.DataType;
 import com.opcproxy.persistence.enums.ReadMode;
 import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.ui.services.IntervalProfileService;
 import com.opcproxy.ui.services.TagService;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
@@ -2702,37 +5309,63 @@ import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.component.textfield.TextArea;
 import com.vaadin.flow.component.textfield.TextField;
 import com.vaadin.flow.data.binder.Binder;
+import com.vaadin.flow.data.binder.ValidationException;
+import com.vaadin.flow.data.binder.ValidationResult;
 import com.vaadin.flow.data.validator.StringLengthValidator;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
 
+/**
+ * Диалог создания/редактирования тега.
+ * Динамическая форма: поля зависят от sourceType.
+ *   DA   -> connection + sourceItemId (+ readMode, периоды)
+ *   CALC -> expression (формула SpEL) + валидация зависимостей
+ */
 @Slf4j
 public class TagDialog extends Dialog {
 
     private final TagService tagService;
     private final OpcDaConnectionRepository connectionRepository;
+    private final CalcDependencyValidator calcValidator;
     private final Runnable onSaveCallback;
+    private final TextField mqttDeadbandField = new TextField("MQTT Deadband");
 
     private final TextField nameField = new TextField("Tag Name");
     private final ComboBox<SourceType> sourceTypeBox = new ComboBox<>("Source Type");
-    private final ComboBox<OpcDaConnection> connectionBox = new ComboBox<>("OPC DA Connection");
-    private final TextField sourceItemIdField = new TextField("Item ID / Tag Path");
+    private final ComboBox<OpcDaConnection> connectionBox = new ComboBox<>("Connection");
+    private final TextField sourceItemIdField = new TextField("Source ItemID");
+    private final TextArea expressionArea = new TextArea("Expression (SpEL)");
     private final ComboBox<DataType> dataTypeBox = new ComboBox<>("Data Type");
     private final ComboBox<ReadMode> readModeBox = new ComboBox<>("Read Mode");
     private final IntegerField refreshPeriodField = new IntegerField("Refresh Period (ms)");
     private final Checkbox enabledCheckbox = new Checkbox("Enabled");
+    private final Checkbox publishMqttCheckbox = new Checkbox("Publish to MQTT");
     private final TextArea descriptionArea = new TextArea("Description");
+    private final ComboBox<IntervalProfile> profileBox = new ComboBox<>("UA Interval Profile");
 
+    private final IntervalProfileRepository profileRepository;
     private final Binder<Tag> binder = new Binder<>(Tag.class);
     private Tag currentTag;
 
-    public TagDialog(TagService tagService, OpcDaConnectionRepository connectionRepository, Runnable onSaveCallback) {
+    public TagDialog(TagService tagService,
+                     OpcDaConnectionRepository connectionRepository,
+                     Runnable onSaveCallback, IntervalProfileRepository profileRepository) {
+        this(tagService, connectionRepository, null, onSaveCallback, profileRepository);
+    }
+
+    /** Конструктор с валидатором (рекомендуемый; null-валидатор => проверка формулы отключена). */
+    public TagDialog(TagService tagService,
+                     OpcDaConnectionRepository connectionRepository,
+                     CalcDependencyValidator calcValidator,
+                     Runnable onSaveCallback, IntervalProfileRepository profileRepository) {
         this.tagService = tagService;
         this.connectionRepository = connectionRepository;
+        this.calcValidator = calcValidator;
         this.onSaveCallback = onSaveCallback;
+        this.profileRepository = profileRepository;
 
-        setHeaderTitle("OPC Tag Configuration");
+        setHeaderTitle("Tag");
         setCloseOnOutsideClick(false);
         setWidth("600px");
 
@@ -2741,40 +5374,61 @@ public class TagDialog extends Dialog {
         buildLayout();
     }
 
+    // ------------------------------------------------------------------
+
     private void configureFields() {
         nameField.setRequired(true);
-        nameField.setPlaceholder("e.g., Tank1_Level");
+        nameField.setPlaceholder("e.g. Tank1_Level");
 
         sourceTypeBox.setItems(SourceType.values());
         sourceTypeBox.setItemLabelGenerator(Enum::name);
         sourceTypeBox.setRequired(true);
+        // ГЛАВНОЕ: переключение видимости полей по типу источника
+        sourceTypeBox.addValueChangeListener(e -> updateFieldVisibility(e.getValue()));
 
         connectionBox.setItems(connectionRepository.findAll());
         connectionBox.setItemLabelGenerator(OpcDaConnection::getName);
+        connectionBox.setWidthFull();
 
-        sourceItemIdField.setPlaceholder("e.g., Channel1.Device1.Tag1");
+        sourceItemIdField.setPlaceholder("e.g. Test/Float");
+        sourceItemIdField.setWidthFull();
+
+        expressionArea.setPlaceholder("#Tank1_Level > 80 ? 'HIGH' : 'OK'");
+        expressionArea.setMinHeight("90px");
+        expressionArea.setWidthFull();
+        expressionArea.setHelperText(
+                "SpEL: #TagName — ссылки, T(java.lang.Math) — функции. Валидация при сохранении.");
 
         dataTypeBox.setItems(DataType.values());
         dataTypeBox.setItemLabelGenerator(Enum::name);
-        dataTypeBox.setRequired(true);
 
         readModeBox.setItems(ReadMode.values());
         readModeBox.setItemLabelGenerator(Enum::name);
 
+        profileBox.setItems(profileRepository.findAll());
+        profileBox.setItemLabelGenerator(IntervalProfile::getName);
+        profileBox.setAllowCustomValue(false);
+
         refreshPeriodField.setMin(100);
         refreshPeriodField.setStep(100);
-        refreshPeriodField.setRequired(true);
+        refreshPeriodField.setValue(1000);
+        mqttDeadbandField.setPlaceholder("e.g. 0.5 (0 = публиковать все изменения)");
+        mqttDeadbandField.setHelperText("Опубликовать при изменении больше чем на значение");
+        descriptionArea.setMaxLength(800);
+        descriptionArea.setMinHeight("70px");
+        publishMqttCheckbox.addValueChangeListener(e ->
+                mqttDeadbandField.setVisible(Boolean.TRUE.equals(e.getValue())));
+    }
 
-        descriptionArea.setMaxLength(500);
+    /** Динамическая видимость: DA -> connection+ItemID; CALC -> формула. */
+    private void updateFieldVisibility(SourceType type) {
+        boolean isDA = type == SourceType.DA;
+        boolean isCALC = type == SourceType.CALC;
 
-        // Логика показа/скрытия полей OPC DA
-        sourceTypeBox.addValueChangeListener(e -> {
-            boolean isDa = e.getValue() == SourceType.DA;
-            connectionBox.setVisible(isDa);
-            sourceItemIdField.setVisible(isDa);
-            readModeBox.setVisible(isDa);
-            refreshPeriodField.setVisible(isDa);
-        });
+        connectionBox.setVisible(isDA);
+        sourceItemIdField.setVisible(isDA);
+        readModeBox.setVisible(isDA);
+        expressionArea.setVisible(isCALC);
     }
 
     private void configureBinder() {
@@ -2782,14 +5436,96 @@ public class TagDialog extends Dialog {
                 .withValidator(new StringLengthValidator("Name must be 1-255 characters", 1, 255))
                 .bind(Tag::getName, Tag::setName);
 
-        binder.bind(sourceTypeBox, Tag::getSourceType, Tag::setSourceType);
-        binder.bind(connectionBox, Tag::getConnection, Tag::setConnection);
-        binder.bind(sourceItemIdField, Tag::getSourceItemId, Tag::setSourceItemId);
-        binder.bind(dataTypeBox, Tag::getDataType, Tag::setDataType);
-        binder.bind(readModeBox, Tag::getReadMode, Tag::setReadMode);
-        binder.bind(refreshPeriodField, Tag::getRefreshPeriodMs, Tag::setRefreshPeriodMs);
+        binder.forField(sourceTypeBox)
+                .withValidator(v -> v != null, "Выберите тип источника")
+                .bind(Tag::getSourceType, Tag::setSourceType);
+
+        // DA-поля: обязательны только для DA (проверка в валидаторе, а не глобально)
+        binder.forField(connectionBox)
+                .withValidator(this::validateConnectionForDA)
+                .bind(Tag::getConnection, Tag::setConnection);
+
+        binder.forField(sourceItemIdField)
+                .withValidator(this::validateItemIdForDA)
+                .bind(Tag::getSourceItemId, Tag::setSourceItemId);
+
+        // Формула: валидация синтаксиса + зависимостей (для CALC)
+        binder.forField(expressionArea)
+                .withValidator(this::validateExpression)
+                .bind(Tag::getExpression, Tag::setExpression);
+
+        binder.forField(profileBox)
+                .bind(Tag::getIntervalProfile, Tag::setIntervalProfile);
+
+        binder.forField(dataTypeBox)
+                .withValidator(v -> v != null, "Выберите тип данных")
+                .bind(Tag::getDataType, Tag::setDataType);
+
+        binder.forField(readModeBox)
+                .bind(Tag::getReadMode, Tag::setReadMode);
+
+        binder.forField(refreshPeriodField)
+                .withConverter(v -> v == null ? 1000 : v, v -> v)
+                .bind(Tag::getRefreshPeriodMs, Tag::setRefreshPeriodMs);
+        binder.forField(mqttDeadbandField)
+                .withConverter(
+                        s -> (s == null || s.isBlank()) ? null : s.trim().replace(',', '.'),
+                        Object::toString)
+                .withValidator(s -> {
+                    if (s == null || s.isBlank()) return true;
+                    try { return Float.parseFloat(s) >= 0; }
+                    catch (NumberFormatException e) { return false; }
+                }, "Число >= 0 (например 0.5)")
+                .withConverter(
+                        s -> (s == null || s.isBlank()) ? null : Float.parseFloat(s),
+                        f -> f == null ? "" : String.valueOf(f))
+                .bind(Tag::getMqttDeadband, Tag::setMqttDeadband);
+
         binder.bind(enabledCheckbox, Tag::getEnabled, Tag::setEnabled);
+        binder.bind(publishMqttCheckbox, Tag::getPublishMqtt, Tag::setPublishMqtt);
         binder.bind(descriptionArea, Tag::getDescription, Tag::setDescription);
+    }
+
+    private ValidationResult validateConnectionForDA(OpcDaConnection conn,
+                                                     com.vaadin.flow.data.binder.ValueContext ctx) {
+        SourceType st = sourceTypeBox.getValue();
+        if (st == SourceType.DA && conn == null) {
+            return ValidationResult.error("Для DA-тега обязательно подключение");
+        }
+        return ValidationResult.ok();
+    }
+
+    private ValidationResult validateItemIdForDA(String itemId,
+                                                 com.vaadin.flow.data.binder.ValueContext ctx) {
+        SourceType st = sourceTypeBox.getValue();
+        if (st == SourceType.DA && (itemId == null || itemId.isBlank())) {
+            return ValidationResult.error("Для DA-тега обязателен ItemID");
+        }
+        return ValidationResult.ok();
+    }
+
+    private ValidationResult validateExpression(String expr,
+                                                com.vaadin.flow.data.binder.ValueContext ctx) {
+        SourceType st = sourceTypeBox.getValue();
+        if (st != SourceType.CALC) {
+            return ValidationResult.ok();   // для DA формула не нужна
+        }
+        if (expr == null || expr.isBlank()) {
+            return ValidationResult.error("Для CALC-тега обязательна формула");
+        }
+        if (calcValidator == null) {
+            return ValidationResult.ok();   // движок ещё не собран — только UI-проверка
+        }
+        // Полная проверка: синтаксис, ссылки, циклы, глубина
+        Tag probe = new Tag();
+        probe.setName(nameField.getValue());
+        probe.setSourceType(SourceType.CALC);
+        probe.setExpression(expr);
+        var result = calcValidator.validate(probe);
+        if (!result.ok()) {
+            return ValidationResult.error(String.join("; ", result.errors()));
+        }
+        return ValidationResult.ok();
     }
 
     private void buildLayout() {
@@ -2801,17 +5537,30 @@ public class TagDialog extends Dialog {
         row1.setWidthFull();
         row1.setFlexGrow(1, nameField, sourceTypeBox);
 
-        HorizontalLayout row2 = new HorizontalLayout(connectionBox, sourceItemIdField);
+        connectionBox.setWidthFull();
+        sourceItemIdField.setWidthFull();
+        expressionArea.setWidthFull();
+
+        HorizontalLayout row2 = new HorizontalLayout(dataTypeBox, readModeBox, refreshPeriodField);
         row2.setWidthFull();
-        row2.setFlexGrow(1, connectionBox, sourceItemIdField);
+        row2.setFlexGrow(1, dataTypeBox, readModeBox, refreshPeriodField);
 
-        HorizontalLayout row3 = new HorizontalLayout(dataTypeBox, readModeBox, refreshPeriodField);
+        HorizontalLayout row3 = new HorizontalLayout(enabledCheckbox, publishMqttCheckbox, mqttDeadbandField);
         row3.setWidthFull();
-        row3.setFlexGrow(1, dataTypeBox, readModeBox, refreshPeriodField);
+        row3.setFlexGrow(1, enabledCheckbox, publishMqttCheckbox, mqttDeadbandField);
 
-        layout.add(row1, row2, row3, enabledCheckbox, descriptionArea);
+        descriptionArea.setWidthFull();
 
-        Button saveButton = new Button("Save", e -> save());
+        layout.add(row1, connectionBox, sourceItemIdField, expressionArea,
+                row2, profileBox, row3, descriptionArea);
+
+        Button saveButton = new Button("Save", e -> {
+            try {
+                save();
+            } catch (ValidationException ex) {
+                throw new RuntimeException(ex);
+            }
+        });
         saveButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
 
         Button cancelButton = new Button("Cancel", e -> close());
@@ -2828,44 +5577,50 @@ public class TagDialog extends Dialog {
     public void edit(Tag tag) {
         if (tag == null) {
             currentTag = new Tag();
-            currentTag.setSourceType(SourceType.DA);
-            currentTag.setDataType(DataType.FLOAT);
+            currentTag.setSourceType(SourceType.DA);   // дефолт — DA
             currentTag.setReadMode(ReadMode.ASYNC);
             currentTag.setRefreshPeriodMs(1000);
             currentTag.setEnabled(true);
+            currentTag.setPublishMqtt(false);
         } else {
             currentTag = tag;
         }
+
         binder.setBean(currentTag);
+        // Видимость выставляем ЯВНО по фактическому типу (надёжнее, чем ждать listener:
+        // при setBean listener сработает, но порядок/повторы не гарантированы)
+        updateFieldVisibility(currentTag.getSourceType());
+
         setHeaderTitle(tag == null ? "Add Tag" : "Edit Tag");
+        mqttDeadbandField.setVisible(Boolean.TRUE.equals(currentTag.getPublishMqtt()));
         open();
     }
 
-    private void save() {
-        if (binder.validate().isOk()) {
-            if (currentTag.getId() == null && tagService.existsByName(currentTag.getName())) {
-                Notification.show("Tag name must be unique", 3000, Notification.Position.MIDDLE);
-                return;
-            }
-            if (currentTag.getSourceType() == SourceType.DA && currentTag.getConnection() == null) {
-                Notification.show("Please select an OPC DA Connection", 3000, Notification.Position.MIDDLE);
-                return;
-            }
-
-            tagService.save(currentTag);
-            onSaveCallback.run();
-            close();
-            Notification.show("Tag saved successfully", 2000, Notification.Position.BOTTOM_END);
-        } else {
-            Notification.show("Please fix validation errors", 2000, Notification.Position.MIDDLE);
+    private void save() throws ValidationException {
+        if (!binder.validate().isOk()) {
+            Notification.show("Please fix validation errors", 3000, Notification.Position.MIDDLE);
+            return;
         }
+        binder.writeBean(currentTag);
+
+        if (currentTag.getId() == null && tagService.existsByName(currentTag.getName())) {
+            Notification.show("Tag name must be unique", 3000, Notification.Position.MIDDLE);
+            return;
+        }
+
+        tagService.save(currentTag);
+        onSaveCallback.run();
+        close();
+        Notification.show("Tag saved", 2000, Notification.Position.BOTTOM_END);
     }
 }
 ============================================================
 
 package com.opcproxy.ui.views;
 
+import com.opcproxy.calc.CalcDependencyValidator;
 import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.services.TagService;
@@ -2905,6 +5660,8 @@ public class TagsView extends VerticalLayout {
     private final TagService tagService;
     private final TagRegistry tagRegistry;
     private final OpcDaConnectionRepository connectionRepository;
+    private final IntervalProfileRepository profileRepository;
+    private final CalcDependencyValidator calcValidator;   // опционально, но рекомендую
 
     private final Grid<Tag> grid = new Grid<>();
     private final TagDialog dialog;
@@ -2916,13 +5673,16 @@ public class TagsView extends VerticalLayout {
     // Конструктор теперь управляется Spring через @RequiredArgsConstructor,
     // но мы можем явно его объявить для инициализации dialog, если нужно,
     // или инициализировать dialog прямо в поле.
-    public TagsView(TagService tagService, TagRegistry tagRegistry, OpcDaConnectionRepository connectionRepository) {
+    public TagsView(TagService tagService, TagRegistry tagRegistry, OpcDaConnectionRepository connectionRepository, IntervalProfileRepository profileRepository, CalcDependencyValidator calcValidator) {
         this.tagService = tagService;
         this.tagRegistry = tagRegistry;
         this.connectionRepository = connectionRepository;
+        this.profileRepository = profileRepository;
+        this.calcValidator = calcValidator;
 
         // Инициализируем диалог
-        this.dialog = new TagDialog(tagService, connectionRepository, this::refreshGrid);
+        this.dialog = new TagDialog(tagService, connectionRepository,
+                calcValidator, this::refreshGrid, profileRepository);
 
         addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
         setWidthFull();

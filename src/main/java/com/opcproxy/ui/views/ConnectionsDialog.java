@@ -93,7 +93,6 @@ public class ConnectionsDialog extends Dialog {
 
         binder.bind(domainField, OpcDaConnection::getDomain, OpcDaConnection::setDomain);
         binder.bind(usernameField, OpcDaConnection::getUsername, OpcDaConnection::setUsername);
-        binder.bind(passwordField, OpcDaConnection::getPasswordEncrypted, OpcDaConnection::setPasswordEncrypted);
         binder.bind(readModeBox, OpcDaConnection::getDefaultReadMode, OpcDaConnection::setDefaultReadMode);
         binder.bind(refreshPeriodField, OpcDaConnection::getDefaultRefreshPeriodMs, OpcDaConnection::setDefaultRefreshPeriodMs);
         binder.bind(reconnectIntervalField, OpcDaConnection::getReconnectIntervalMs, OpcDaConnection::setReconnectIntervalMs);
@@ -117,6 +116,8 @@ public class ConnectionsDialog extends Dialog {
         // Строка 3: Домен, Пользователь, Пароль
         HorizontalLayout row2 = new HorizontalLayout(domainField, usernameField, passwordField);
         row2.setWidthFull();
+        passwordField.clear();
+        passwordField.setPlaceholder("Пусто = не менять пароль");
         row2.setFlexGrow(1, domainField, usernameField, passwordField);
 
         // Строка 4: Режим, Интервалы
@@ -163,12 +164,20 @@ public class ConnectionsDialog extends Dialog {
         }
 
         binder.setBean(currentConnection);
+        passwordField.clear();                                  // всегда чистое поле
+        passwordField.setPlaceholder("Пусто = не менять пароль");
         setHeaderTitle(connection == null ? "Add Connection" : "Edit Connection");
         open();
     }
 
     private void save() {
         if (binder.validate().isOk()) {
+            // В save():
+            if (passwordField.getValue() == null || passwordField.getValue().isBlank()) {
+                // НЕ трогаем passwordEncrypted — save() скопирует старое из БД (логика «empty = keep»)
+            } else {
+                currentConnection.setPasswordEncrypted(passwordField.getValue());  // plaintext → save() зашифрует
+            }
             if (currentConnection.getId() == null && connectionService.existsByName(currentConnection.getName())) {
                 Notification.show("Connection name must be unique", 3000, Notification.Position.MIDDLE);
                 return;
@@ -185,12 +194,18 @@ public class ConnectionsDialog extends Dialog {
 
     private void testConnection() {
         if (binder.validate().isOk()) {
-            // Принудительно сохраняем значения из формы в объект перед тестом
             binder.writeBeanIfValid(currentConnection);
-            String result = connectionService.testConnection(currentConnection);
-            Notification.show(result, 4000, Notification.Position.MIDDLE);
-        } else {
-            Notification.show("Please fill required fields before testing", 2000, Notification.Position.MIDDLE);
+            // Тестируем С ТЕМ паролем, который реально будет сохранён:
+            if (passwordField.getValue() == null || passwordField.getValue().isBlank()) {
+                // пусто = тест со старым паролем из БД
+                connectionService.findById(currentConnection.getId())
+                        .ifPresent(old -> currentConnection.setPasswordEncrypted(old.getPasswordEncrypted()));
+            } else {
+                currentConnection.setPasswordEncrypted(passwordField.getValue()); // plaintext, decrypt сам разберётся
+                Notification.show("Please fill required fields before testing", 2000, Notification.Position.MIDDLE);
+            }
         }
+        String result = connectionService.testConnection(currentConnection);
+        Notification.show(result, 4000, Notification.Position.MIDDLE);
     }
 }

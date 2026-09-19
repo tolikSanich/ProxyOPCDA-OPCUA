@@ -70,6 +70,24 @@ public class OpcDaConnectionManager {
         locks.clear();
     }
 
+    /**
+     * ТЗ §5.2.8: теги с Bad_NotFound периодически перепроверяются.
+     * Механика: если у живого подключения есть неподписавшиеся ItemID,
+     * перезапускаем поллер — он выполнит subscribeAll() заново, и
+     * отсутствовавшие ранее ItemID получат второй шанс добавиться.
+     */
+    @Scheduled(fixedDelayString = "${app.opcda.notfound-recheck-ms:300000}")
+    public void recheckNotFoundTags() {
+        clients.forEach((id, client) -> {
+            if (client.isConnected() && client.hasNotFoundItems()) {
+                log.info("Recheck: resubscribing {} not-found items of '{}'",
+                        client.getNotFoundCount(), client.getConnectionConfig().getName());
+                stopPoller(id);
+                startPoller(id, client);
+            }
+        });
+    }
+
     // ------------------------------------------------------------------
     // API
     // ------------------------------------------------------------------
@@ -81,7 +99,8 @@ public class OpcDaConnectionManager {
                 return true;
             }
             try {
-                OpcDaClient client = new OpcDaClient(connection, passwordCipher);
+                OpcDaClient client = new OpcDaClient(connection, passwordCipher, tagRegistry);
+
                 client.connect();
                 clients.put(id, client);
                 clearBackoff(id);
@@ -180,7 +199,7 @@ public class OpcDaConnectionManager {
                     if (client != null) clients.remove(id);
                     return;
                 }
-                OpcDaClient fresh = new OpcDaClient(conn, passwordCipher);
+                OpcDaClient fresh = new OpcDaClient(conn, passwordCipher, tagRegistry);
                 fresh.connect();
                 clients.put(id, fresh);
                 clearBackoff(id);

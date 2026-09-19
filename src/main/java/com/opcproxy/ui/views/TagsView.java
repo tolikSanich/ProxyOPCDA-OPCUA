@@ -1,6 +1,8 @@
 package com.opcproxy.ui.views;
 
+import com.opcproxy.calc.CalcDependencyValidator;
 import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.services.TagService;
@@ -40,6 +42,8 @@ public class TagsView extends VerticalLayout {
     private final TagService tagService;
     private final TagRegistry tagRegistry;
     private final OpcDaConnectionRepository connectionRepository;
+    private final IntervalProfileRepository profileRepository;
+    private final CalcDependencyValidator calcValidator;   // опционально, но рекомендую
 
     private final Grid<Tag> grid = new Grid<>();
     private final TagDialog dialog;
@@ -51,13 +55,16 @@ public class TagsView extends VerticalLayout {
     // Конструктор теперь управляется Spring через @RequiredArgsConstructor,
     // но мы можем явно его объявить для инициализации dialog, если нужно,
     // или инициализировать dialog прямо в поле.
-    public TagsView(TagService tagService, TagRegistry tagRegistry, OpcDaConnectionRepository connectionRepository) {
+    public TagsView(TagService tagService, TagRegistry tagRegistry, OpcDaConnectionRepository connectionRepository, IntervalProfileRepository profileRepository, CalcDependencyValidator calcValidator) {
         this.tagService = tagService;
         this.tagRegistry = tagRegistry;
         this.connectionRepository = connectionRepository;
+        this.profileRepository = profileRepository;
+        this.calcValidator = calcValidator;
 
         // Инициализируем диалог
-        this.dialog = new TagDialog(tagService, connectionRepository, this::refreshGrid);
+        this.dialog = new TagDialog(tagService, connectionRepository,
+                calcValidator, this::refreshGrid, profileRepository);
 
         addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
         setWidthFull();

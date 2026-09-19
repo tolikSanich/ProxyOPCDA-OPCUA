@@ -4,6 +4,7 @@ import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.security.PasswordCipher;
+import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.MainLayout;
 import com.opcproxy.ui.services.ConnectionService;
 import com.vaadin.flow.component.button.Button;
@@ -40,7 +41,9 @@ public class ConnectionsView extends VerticalLayout {
     private final Grid<OpcDaConnection> grid = new Grid<>();
     private final ConnectionsDialog dialog;
     private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
-    public ConnectionsView(ConnectionService connectionService, PasswordCipher passwordCipher) {
+    private final TagRegistry tagRegistry;
+
+    public ConnectionsView(ConnectionService connectionService, PasswordCipher passwordCipher, TagRegistry tagRegistry) {
         this.connectionService = connectionService;
         this.dialog = new ConnectionsDialog(connectionService, this::refreshGrid);
         this.passwordCipher = passwordCipher;
@@ -53,6 +56,7 @@ public class ConnectionsView extends VerticalLayout {
         createContextMenu();
 
         refreshGrid();
+        this.tagRegistry = tagRegistry;
     }
 
     private void createHeader() {
@@ -203,7 +207,7 @@ public class ConnectionsView extends VerticalLayout {
     }
 
     public String testConnection(OpcDaConnection connection) {
-        OpcDaClient testClient = new OpcDaClient(connection,passwordCipher);
+        OpcDaClient testClient = new OpcDaClient(connection,passwordCipher,tagRegistry);
         try {
             testClient.connect();
             testClient.disconnect();
