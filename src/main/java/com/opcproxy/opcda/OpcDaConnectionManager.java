@@ -3,6 +3,7 @@ package com.opcproxy.opcda;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.security.PasswordCipher;
 import com.opcproxy.tags.TagRegistry;
 import jakarta.annotation.PreDestroy;
@@ -13,6 +14,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,12 +36,21 @@ public class OpcDaConnectionManager {
     private final Map<Long, OpcDaClient> clients = new ConcurrentHashMap<>();
     private final Map<Long, ConnectionPoller> pollers = new ConcurrentHashMap<>();
 
+
+    private static final long RETRY_BASE_MS = 5_000;
+    private static final long RETRY_MAX_MS  = 60_000;
+
+    // Кэш для браузинга (ТЗ §5.2.6: кэширование результатов на сессию или TTL)
+    private static final long BROWSE_CACHE_TTL_MS = 60_000; // 60 секунд
+    private final Map<Long, List<RestDtos.BrowseNodeDto>> browseCache = new ConcurrentHashMap<>();
+    private final Map<Long, Long> browseCacheTime = new ConcurrentHashMap<>();
+
+
+
     private final Map<Long, Long> nextAttemptAt = new ConcurrentHashMap<>();
     private final Map<Long, Integer> attemptCount = new ConcurrentHashMap<>();
     private final Map<Long, Object> locks = new ConcurrentHashMap<>();
 
-    private static final long RETRY_BASE_MS = 5_000;
-    private static final long RETRY_MAX_MS  = 60_000;
 
     // ------------------------------------------------------------------
     // Жизненный цикл
@@ -114,7 +125,6 @@ public class OpcDaConnectionManager {
             }
         }
     }
-
     public void disconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
             stopPoller(connectionId);
@@ -122,8 +132,8 @@ public class OpcDaConnectionManager {
             if (client != null) {
                 client.disconnect();
                 clearBackoff(connectionId);
-                log.info("Disconnected and removed OPC DA server: {}",
-                        client.getConnectionConfig().getName());
+                invalidateBrowseCache(connectionId); // <-- ОЧИСТКА КЭША
+                log.info("Disconnected and removed OPC DA server: {}", client.getConnectionConfig().getName());
             }
         }
     }
@@ -146,6 +156,42 @@ public class OpcDaConnectionManager {
                         client.getConnectionConfig().getName(), e.getMessage());
             }
         }
+    }
+    /**
+     * Очистка кэша браузинга при переподключении или изменении конфигурации.
+     */
+    public void invalidateBrowseCache(Long connectionId) {
+        browseCache.remove(connectionId);
+        browseCacheTime.remove(connectionId);
+    }
+    /**
+     * Браузинг тегов для конкретного подключения с кэшированием (ТЗ §5.2.6, §5.9.3).
+     *
+     * @param connectionId ID подключения
+     * @return список доступных элементов OPC DA (иерархический или плоский)
+     * @throws Exception если подключение неактивно или ошибка DCOM
+     */
+    public List<RestDtos.BrowseNodeDto> browse(Long connectionId) throws Exception {
+        long now = System.currentTimeMillis();
+        Long lastUpdate = browseCacheTime.get(connectionId);
+
+        if (lastUpdate != null && (now - lastUpdate) < BROWSE_CACHE_TTL_MS) {
+            log.debug("Serving browse cache for connection {}", connectionId);
+            return browseCache.get(connectionId);
+        }
+
+        OpcDaClient client = clients.get(connectionId);
+        if (client == null || !client.isConnected()) {
+            throw new IllegalStateException("Connection not active or not found: " + connectionId);
+        }
+
+        log.info("Fetching fresh browse list for connection {}", connectionId);
+        List<RestDtos.BrowseNodeDto> result = client.browseTree();
+
+        browseCache.put(connectionId, result);
+        browseCacheTime.put(connectionId, now);
+
+        return result;
     }
 
     public Optional<OpcDaClient> getClient(Long connectionId) {

@@ -1,5 +1,6 @@
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -15,7 +16,7 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "interval_profile",
         uniqueConstraints = @UniqueConstraint(name = "uq_interval_profile_name", columnNames = "name"))
-public class IntervalProfile {
+public class IntervalProfile implements Auditable {
 
     @Id
     @EqualsAndHashCode.Include

@@ -4,6 +4,8 @@ import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
 
+import java.util.List;
+
 public final class RestDtos {
 
     private RestDtos() {}
@@ -38,4 +40,12 @@ public final class RestDtos {
                             int tagsTotal, int tagsGood, String opcUaEndpoint) {}
 
     public record ImportResultDto(int total, int created, int updated, int errors) {}
+    public record BrowseNodeDto(
+            String name,
+            String itemId,
+            boolean isBranch,
+            List<BrowseNodeDto> children
+    ) {
+
+    }
 }

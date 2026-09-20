@@ -1,5 +1,6 @@
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.UserRole;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -15,7 +16,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "user_account")
-public class UserAccount {
+public class UserAccount implements Auditable {
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     @EqualsAndHashCode.Include
     private Long id;

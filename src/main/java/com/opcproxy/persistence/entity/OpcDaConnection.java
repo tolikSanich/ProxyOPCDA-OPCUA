@@ -1,5 +1,6 @@
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.ReadMode;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -14,7 +15,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "opc_da_connection")
-public class OpcDaConnection {
+public class OpcDaConnection implements Auditable {
 
     @Id
     @EqualsAndHashCode.Include

@@ -1,8 +1,10 @@
 package com.opcproxy.rest;
 
 import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.opcua.OpcUaServerManager;
 import com.opcproxy.persistence.entity.IntervalProfile;
+import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.rest.dto.RestDtos.ConnectionCreateRequest;
 import com.opcproxy.rest.dto.RestDtos.ConnectionDto;
 import com.opcproxy.rest.dto.RestDtos.StatusDto;
@@ -15,6 +17,7 @@ import com.opcproxy.ui.services.IntervalProfileService;
 import com.opcproxy.ui.services.TagService;
 import io.swagger.v3.oas.annotations.Operation;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -22,7 +25,7 @@ import org.springframework.web.bind.annotation.*;
 import java.net.URI;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-
+@Slf4j
 @io.swagger.v3.oas.annotations.tags.Tag(                          // <-- FQ-имя аннотации
         name = "Gateway API",
         description = "Управление подключениями и тегами шлюза (ТЗ §5.9)")
@@ -38,6 +41,7 @@ public class GatewayApiController {
     private final TagService tagService;
     private final TagRegistry tagRegistry;
     private final OpcUaServerManager opcUaServerManager;
+    private final OpcDaConnectionManager connectionManager;
     // ---------------- Status ----------------
 
     @Operation(summary = "Сводный статус шлюза")
@@ -58,6 +62,20 @@ public class GatewayApiController {
                 : null;
         return new StatusDto(conns.size(), (int) connected,
                 tags.size(), (int) good, uaEndpoint);
+    }
+    @Operation(summary = "Браузинг тегов OPC DA (плоский список с кэшированием 60с, ТЗ §5.2.6, §5.9.3)")
+    @GetMapping("/connections/{id}/browse")
+    public ResponseEntity<List<RestDtos.BrowseNodeDto>> browse(@PathVariable Long id) {
+        try {
+            List<RestDtos.BrowseNodeDto> result = connectionManager.browse(id);
+            return ResponseEntity.ok(result);
+        } catch (IllegalStateException e) {
+            log.warn("Browse failed (not connected) for connection {}: {}", id, e.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        } catch (Exception e) {
+            log.error("Browse failed for connection {}: {}", id, e.getMessage());
+            throw new IllegalStateException("Ошибка браузинга OPC DA: " + e.getMessage());
+        }
     }
 
     // ---------------- Connections ----------------

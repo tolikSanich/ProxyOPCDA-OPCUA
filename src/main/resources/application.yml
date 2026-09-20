@@ -36,8 +36,15 @@ spring:
 # Custom Application Properties
 app:
   opcua:
-    port: 55700
+    port: 4840
     hostname: localhost
+    enabled-policies:
+      - None
+      - Basic256Sha256
+    trust-all-clients: true      # для стенда; прод = false
+    pki-dir: pki
+    trust-store-dir: pki/trusted
+    rejected-store-dir: pki/rejected
     application-name: "OPC DA-UA Proxy"
     application-uri: "urn:opcproxy:ua:application"
     namespace-uri: "urn:opcproxy:ua"

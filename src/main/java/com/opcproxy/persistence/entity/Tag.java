@@ -1,5 +1,6 @@
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.DataType;
 import com.opcproxy.persistence.enums.ReadMode;
 import com.opcproxy.persistence.enums.SourceType;
@@ -17,7 +18,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "tag")
-public class Tag {
+public class Tag implements Auditable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
