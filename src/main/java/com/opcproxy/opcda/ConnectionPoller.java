@@ -15,8 +15,9 @@ import java.util.stream.Collectors;
  * Петля жизненного цикла одного подключения на виртуальном потоке.
  *
  * Обязанности:
- *  - поддерживать подписку SyncAccess, пересоздавая её при изменении
- *    набора тегов / периода (изменения через UI подхватываются без рестарта);
+ *  - поддерживать подписку (Async20, при неудаче — SyncAccess), пересоздавая
+ *    её при изменении набора тегов / периода (изменения через UI
+ *    подхватываются без рестарта);
  *  - health-check канала (checkAlive) каждый цикл;
  *  - при смерти канала выйти — менеджер поднимет reconnect + новый поллер.
  *
@@ -25,19 +26,21 @@ import java.util.stream.Collectors;
 @Slf4j
 public class ConnectionPoller implements Runnable {
 
-    /** Сколько циклов (по 1 с) держим подписку до проверки изменений. */
+    /** Сколько циклов (по 1 с) между проверками, что подписка вообще существует. */
     private static final int RESUBSCRIBE_CHECK_DIVIDER = 5;
     private static final long CYCLE_MS = 1000;
 
     private final OpcDaClient client;
     private final TagRepository tagRepository;
     private final TagRegistry tagRegistry;
-    private boolean lastNoTags = true;
 
     private volatile boolean running = true;
-    private int subscribedHash = 0;   // hash набора (itemId + period) активной подписки
+    /** hash набора (itemId + period) активной подписки. 0 = ещё не подписаны. */
+    private int subscribedHash = 0;
 
-    public ConnectionPoller(OpcDaClient client, TagRepository tagRepository, TagRegistry tagRegistry) {
+    public ConnectionPoller(OpcDaClient client,
+                            TagRepository tagRepository,
+                            TagRegistry tagRegistry) {
         this.client = client;
         this.tagRepository = tagRepository;
         this.tagRegistry = tagRegistry;
@@ -56,27 +59,29 @@ public class ConnectionPoller implements Runnable {
         while (running) {
             try {
                 if (!client.isConnected()) {
-                    log.info("'{}': connection lost, poller exits (manager will reconnect)", name);
                     break;
                 }
 
                 List<Tag> tags = tagsOfThisConnection();
-
-                // Пересоздание подписки при изменении набора тегов/периода
                 int desiredHash = desiredHash(tags);
                 boolean needResubscribe = desiredHash != subscribedHash;
-                if (needResubscribe || (cycle % RESUBSCRIBE_CHECK_DIVIDER == 0 && !client.isSubscribed())) {
+
+                // Периодически проверяем, что подписка реально жива.
+                // isSubscribed() == false после silent-failure Async20
+                // (см. OpcDaClient.subscribeAsyncAll) или после markConnectionLost().
+                boolean subscriptionMissing = (cycle % RESUBSCRIBE_CHECK_DIVIDER == 0)
+                        && !tags.isEmpty()
+                        && !client.isSubscribed();
+
+                if (needResubscribe || subscriptionMissing) {
                     long period = periodOf(tags);
-                    int n = client.subscribeAll(tags, period, this::onValue);
-                    subscribedHash = needResubscribe ? desiredHash : subscribedHash;
-                    boolean noTags = tags.isEmpty();
-                    if (noTags != lastNoTags) {           // поле private boolean lastNoTags = true;
-                        log.info("'{}': {}", name, noTags ? "no tags configured yet" : "tags found, subscribing");
-                        lastNoTags = noTags;
+                    boolean ok = establishSubscription(tags, period, name);
+                    if (ok) {
+                        subscribedHash = desiredHash;
                     }
+                    // иначе subscribedHash не трогаем — повторим на следующем цикле
                 }
 
-                // Health-check: смерть канала -> выход, менеджер поднимет заново
                 if (!client.checkAlive()) {
                     log.warn("'{}': health check failed, poller exits", name);
                     break;
@@ -99,16 +104,79 @@ public class ConnectionPoller implements Runnable {
         log.info("Poller (virtual) stopped for '{}'", name);
     }
 
+    // ------------------------------------------------------------------
+    // Подписка: Async20 -> SyncAccess fallback
+    // ------------------------------------------------------------------
+
+    /**
+     * Устанавливает подписку. Порядок:
+     *   1. Если тегов нет — просто сбрасываем текущую подписку.
+     *   2. Если клиент ещё считает Async20 поддерживаемым — пробуем Async20.
+     *      При ЛЮБОЙ ошибке (в т.ч. silent failure внутри bind()) помечаем
+     *      Async20 недоступным и переходим к п.3.
+     *   3. Пробуем SyncAccess. Если и он падает — пробрасываем исключение,
+     *      внешний catch вызовет handleConnectionFailure.
+     *
+     * @return true, если подписка успешно установлена (или тегов нет).
+     */
+    private boolean establishSubscription(List<Tag> tags, long period, String name)
+            throws Exception {
+
+        // --- Нет тегов: останавливаем любую текущую подписку ---
+        if (tags.isEmpty()) {
+            try {
+                client.stopSubscription();
+            } catch (Exception e) {
+                log.debug("'{}': stopSubscription for empty tag set failed: {}",
+                        name, e.getMessage());
+            }
+            log.debug("'{}': no tags to subscribe", name);
+            return true;
+        }
+
+        // --- Пытаемся Async20 (если ещё не помечен как нерабочий) ---
+        if (client.isAsyncSupported()) {
+            try {
+                log.debug("'{}': attempting Async20 subscription for {} tags", name, tags.size());
+                client.subscribeAsyncAll(tags, period, this::onValue);
+                log.info("'{}': Async20 subscription established ({} tags)", name, tags.size());
+                return true;
+            } catch (Exception e) {
+                log.warn("'{}': Async20 subscription failed ({}), switching to SyncAccess: {}",
+                        name, e.getClass().getSimpleName(), e.getMessage());
+                client.setAsyncSupported(false);
+                // НЕ пробрасываем — идём в SyncAccess
+            }
+        }
+
+        // --- Fallback: SyncAccess ---
+        try {
+            int n = client.subscribeAll(tags, period, this::onValue);
+            log.info("'{}': SyncAccess subscription established ({} of {} tags)",
+                    name, n, tags.size());
+            return true;
+        } catch (Exception e) {
+            log.warn("'{}': SyncAccess subscription failed: {}", name, e.getMessage());
+            throw e;   // внешний catch -> handleConnectionFailure
+        }
+    }
+
     private void onValue(Long tagId, Object value, String quality, Instant ts) {
         tagRegistry.updateTagValue(tagId, value, quality, ts);
     }
+
+    // ------------------------------------------------------------------
+    // Хелперы
+    // ------------------------------------------------------------------
 
     private List<Tag> tagsOfThisConnection() {
         Long connId = client.getConnectionId();
         return tagRepository.findBySourceType(SourceType.DA).stream()
                 .filter(t -> Boolean.TRUE.equals(t.getEnabled()))
-                .filter(t -> t.getConnection() != null && connId.equals(t.getConnection().getId()))
-                .filter(t -> t.getSourceItemId() != null && !t.getSourceItemId().isBlank())
+                .filter(t -> t.getConnection() != null
+                        && connId.equals(t.getConnection().getId()))
+                .filter(t -> t.getSourceItemId() != null
+                        && !t.getSourceItemId().isBlank())
                 .collect(Collectors.toList());
     }
 
@@ -120,7 +188,8 @@ public class ConnectionPoller implements Runnable {
                 .filter(Objects::nonNull)
                 .min(Integer::compare)     // самый быстрый тег задаёт период группы
                 .map(Integer::longValue)
-                .orElse(Long.valueOf(client.getConnectionConfig().getDefaultRefreshPeriodMs()));
+                .orElse(Long.valueOf(
+                        client.getConnectionConfig().getDefaultRefreshPeriodMs()));
     }
 
     private int desiredHash(List<Tag> tags) {

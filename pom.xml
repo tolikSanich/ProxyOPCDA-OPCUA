@@ -31,30 +31,38 @@
                 <scope>import</scope>
             </dependency>
             <!-- КРИТИЧЕСКИ ВАЖНО: Фиксируем старую версию BC для j-Interop NTLMv2 -->
+<!--            <dependency>-->
+<!--                <groupId>org.bouncycastle</groupId>-->
+<!--                <artifactId>bcprov-jdk15on</artifactId>-->
+<!--                <version>1.50</version>-->
+<!--            </dependency>-->
+<!--            <dependency>-->
+<!--                <groupId>org.bouncycastle</groupId>-->
+<!--                <artifactId>bcpkix-jdk15on</artifactId>-->
+<!--                <version>1.50</version>-->
+<!--            </dependency>-->
             <dependency>
                 <groupId>org.bouncycastle</groupId>
-                <artifactId>bcprov-jdk15on</artifactId>
-                <version>1.50</version>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>1.78.1</version>
             </dependency>
             <dependency>
                 <groupId>org.bouncycastle</groupId>
-                <artifactId>bcpkix-jdk15on</artifactId>
-                <version>1.50</version>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>1.78.1</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>2.18.2</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
 
     <dependencies>
-        <dependency>
-            <groupId>org.bouncycastle</groupId>
-            <artifactId>bcpkix-jdk15on</artifactId>
-            <version>1.50</version>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <!-- Replace artifactId with vaadin-core to use only free components -->
-            <artifactId>vaadin</artifactId>
-        </dependency>
+
         <dependency>
             <groupId>com.vaadin</groupId>
             <artifactId>vaadin-dev</artifactId>
@@ -103,14 +111,9 @@
             <artifactId>milo-sdk-server</artifactId>
             <version>1.1.6</version>
             <exclusions>
-                <!-- Исключаем новую версию BC, которую тянет Milo, чтобы не было конфликта классов -->
                 <exclusion>
                     <groupId>org.bouncycastle</groupId>
-                    <artifactId>bcprov-jdk18on</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.bouncycastle</groupId>
-                    <artifactId>bcpkix-jdk18on</artifactId>
+                    <artifactId>*</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
@@ -120,11 +123,23 @@
             <groupId>org.openscada.utgard</groupId>
             <artifactId>org.openscada.opc.lib</artifactId>
             <version>1.5.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.bouncycastle</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.openscada.utgard</groupId>
             <artifactId>org.openscada.opc.dcom</artifactId>
             <version>1.5.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.bouncycastle</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <!-- Source: https://mvnrepository.com/artifact/org.openscada.jinterop/org.openscada.jinterop.core -->
         <dependency>
@@ -132,15 +147,40 @@
             <artifactId>org.openscada.jinterop.core</artifactId>
             <version>2.1.8</version>
             <scope>compile</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.bouncycastle</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
-
+        <dependency>
+            <groupId>org.openscada.jinterop</groupId>
+            <artifactId>org.openscada.jinterop.deps</artifactId>
+            <version>1.5.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.bouncycastle</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
         <!-- Явно подключаем правильную версию BouncyCastle для j-Interop -->
+<!--        <dependency>-->
+<!--            <groupId>org.bouncycastle</groupId>-->
+<!--            <artifactId>bcprov-jdk15on</artifactId>-->
+<!--            <version>1.50</version>-->
+<!--        </dependency>-->
         <dependency>
             <groupId>org.bouncycastle</groupId>
-            <artifactId>bcprov-jdk15on</artifactId>
-            <version>1.50</version>
+            <artifactId>bcprov-jdk18on</artifactId>
+            <version>1.78.1</version>
         </dependency>
-
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk18on</artifactId>
+            <version>1.78.1</version>
+        </dependency>
         <!-- MQTT -->
         <dependency>
             <groupId>org.eclipse.paho</groupId>
@@ -203,6 +243,9 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <classifier>exec</classifier>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>com.vaadin</groupId>
@@ -216,37 +259,7 @@
                     </execution>
                 </executions>
             </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.0</version>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                        <configuration>
-                            <relocations>
-                                <!-- Перемещаем BC внутри Milo, чтобы он не конфликтовал с системным -->
-                                <relocation>
-                                    <pattern>org.bouncycastle</pattern>
-                                    <shadedPattern>shaded.org.bouncycastle</shadedPattern>
-                                </relocation>
-                            </relocations>
-                            <filters>
-                                <filter>
-                                    <artifact>org.eclipse.milo:*</artifact>
-                                    <includes>
-                                        <include>**</include>
-                                    </includes>
-                                </filter>
-                            </filters>
-                            <createDependencyReducedPom>false</createDependencyReducedPom>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
+
         </plugins>
     </build>
 

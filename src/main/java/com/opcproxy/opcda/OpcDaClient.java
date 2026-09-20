@@ -6,17 +6,15 @@ import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.security.PasswordCipher;
 import com.opcproxy.tags.TagRegistry;
 import lombok.Getter;
+import org.jinterop.dcom.common.JIException;
 import org.openscada.opc.lib.common.ConnectionInformation;
-import org.openscada.opc.lib.da.AccessBase;
-import org.openscada.opc.lib.da.Group;
-import org.openscada.opc.lib.da.Item;
-import org.openscada.opc.lib.da.ItemState;
-import org.openscada.opc.lib.da.Server;
-import org.openscada.opc.lib.da.SyncAccess;
+import org.openscada.opc.lib.common.NotConnectedException;
+import org.openscada.opc.lib.da.*;
 import org.openscada.opc.lib.da.browser.FlatBrowser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.UnknownHostException;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -42,6 +40,8 @@ import java.util.stream.Collectors;
 @Getter
 public class OpcDaClient {
     private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
+    private volatile Async20Access asyncAccess;
+    private final AtomicBoolean asyncSupported = new AtomicBoolean(true);
 
     private static final Set<Class<?>> UA_SAFE = Set.of(
             Boolean.class, Byte.class, Short.class, Integer.class, Long.class,
@@ -133,6 +133,63 @@ public class OpcDaClient {
             throw e;
         }
     }
+    public boolean isAsyncSupported() {
+        return asyncSupported.get();
+    }
+
+    public void setAsyncSupported(boolean supported) {
+        asyncSupported.set(supported);
+    }
+
+    public synchronized int subscribeAsyncAll(Collection<Tag> tags, long periodMs, TagValueSink sink) throws Exception {
+        stopSubscription();
+        if (!connected.get() || server == null) {
+            throw new IllegalStateException("Not connected: " + connectionConfig.getName());
+        }
+        log.info("Subscribing (Async) {} tags of '{}' with period {} ms",
+                tags.size(), connectionConfig.getName(), periodMs);
+
+        FailFastAsync20Access access = new FailFastAsync20Access(server, (int) periodMs, true);
+        int subscribed = 0;
+        for (Tag tag : tags) {
+            try {
+                final Long tagId = tag.getId();
+                access.addItem(tag.getSourceItemId(),
+                        (item, state) -> deliverValue(tagId, state, sink));
+                subscribed++;
+            } catch (Exception e) {
+                log.warn("Async subscribe failed for item '{}': {}",
+                        tag.getSourceItemId(), e.getMessage());
+                throw e;   // триггерит fallback в ConnectionPoller
+            }
+        }
+
+        this.asyncAccess = access;
+        this.access = access;
+
+        try {
+            access.bind();
+        } catch (Exception e) {
+            this.access = null;
+            this.asyncAccess = null;
+            throw e;
+        }
+
+        // КЛЮЧЕВОЕ: Utgard глотает ошибку start() внутри connectionStateChanged(),
+        // поэтому проверяем сохранённую ошибку вручную.
+        Exception startError = access.getStartError();
+        if (startError != null) {
+            log.warn("'{}': Async20 start() failed silently: {} — falling back to SyncAccess",
+                    connectionConfig.getName(), startError.getMessage());
+            try { access.unbind(); } catch (Exception ignore) { /* уже развалилось */ }
+            this.access = null;
+            this.asyncAccess = null;
+            throw startError;
+        }
+
+        return subscribed;
+    }
+
 
     public synchronized void disconnect() {
         if (!connected.get() && server == null) return;
@@ -446,4 +503,30 @@ public class OpcDaClient {
                 scheduler = null;
             }
         }
+    /**
+     * Подкласс Async20Access, который не позволяет Utgard "проглотить"
+     * ошибку в start(): сохраняет её, чтобы subscribeAsyncAll мог
+     * детектировать silent-failure и переключиться на SyncAccess.
+     */
+    private static class FailFastAsync20Access extends Async20Access {
+        private volatile Exception startError;
+
+        FailFastAsync20Access(Server server, int period, boolean initialRefresh) throws DuplicateGroupException, UnknownHostException, NotConnectedException, JIException {
+            super(server, period, initialRefresh);
+        }
+
+        @Override
+        protected void start() throws DuplicateGroupException, UnknownHostException, NotConnectedException, JIException {
+            try {
+                super.start();
+            } catch (Exception e) {
+                this.startError = e;
+                throw e;   // пусть AccessBase тоже залогирует
+            }
+        }
+
+        Exception getStartError() {
+            return startError;
+        }
+    }
     }

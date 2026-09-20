@@ -18,14 +18,16 @@ public class SamplingIntervalResolver {
 
     public double resolve(Tag tag) {
         if (tag == null) return defaultSamplingMs;
+        // 1. Приоритет тега
         if (tag.getUaSamplingIntervalMs() != null && tag.getUaSamplingIntervalMs() > 0) {
             return tag.getUaSamplingIntervalMs();
         }
+        // 2. Приоритет профиля
         if (tag.getIntervalProfile() != null
-                && tag.getIntervalProfile().getUaSamplingIntervalMs() != null
-                && tag.getIntervalProfile().getUaSamplingIntervalMs() > 0) {
+                && tag.getIntervalProfile().getUaSamplingIntervalMs() != null) {
             return tag.getIntervalProfile().getUaSamplingIntervalMs();
         }
+        // 3. Глобальный дефолт
         return defaultSamplingMs;
     }
 }
