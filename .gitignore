@@ -4,7 +4,9 @@
 .settings
 .project
 .classpath
-
+tree.txt
+merged_output.txt
+.gitignore
 *.iml
 .DS_Store
 
