@@ -17,15 +17,34 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "user_account")
 public class UserAccount implements Auditable {
-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     @EqualsAndHashCode.Include
     private Long id;
-    @Column(nullable = false, unique = true) private String username;
-    @Column(name = "password_hash", nullable = false) private String passwordHash;
-    @Enumerated(EnumType.STRING) @Column(nullable = false) private UserRole role = UserRole.USER;
-    @Column(nullable = false) private Boolean enabled = true;
-    @Column(name = "created_at", updatable = false) private LocalDateTime createdAt;
-    @Column(name = "updated_at") private LocalDateTime updatedAt;
-    @PrePersist protected void onCreate() { createdAt = updatedAt = LocalDateTime.now(); }
-    @PreUpdate protected void onUpdate() { updatedAt = LocalDateTime.now(); }
+    @Column(nullable = false, unique = true)
+    private String username;
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private UserRole role = UserRole.USER;
+    @Column(nullable = false)
+    private Boolean enabled = true;
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+    // Добавить в UserAccount.java
+    @Column(name = "force_password_change", nullable = false)
+    private Boolean forcePasswordChange = false; // <-- ДОБАВИТЬ ЭТО ПОЛЕ
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
 }

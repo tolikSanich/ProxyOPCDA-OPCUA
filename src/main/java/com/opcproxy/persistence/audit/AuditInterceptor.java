@@ -14,8 +14,9 @@ import java.util.stream.Collectors;
  * Hibernate Interceptor для автоматического аудита изменений сущностей.
  * ТЗ §5.10.5: перехватывает CREATE/UPDATE/DELETE для сущностей, реализующих Auditable.
  *
- * ВАЖНО: Использует ApplicationEventPublisher вместо прямого вызова сервиса,
- * чтобы избежать циклической зависимости (Circular Dependency) с EntityManagerFactory.
+ * ВАЖНО: В Hibernate 6+ класс EmptyInterceptor удалён. Реализуем интерфейс Interceptor напрямую,
+ * используя default-методы интерфейса для игнорирования ненужных событий.
+ * Параметр id имеет тип Object (не Serializable, как в Hibernate 5).
  */
 @Slf4j
 @Component
@@ -25,7 +26,7 @@ public class AuditInterceptor implements Interceptor {
     private final ApplicationEventPublisher eventPublisher;
 
     @Override
-    public boolean onSave(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
+    public boolean onPersist(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
         if (entity instanceof Auditable) {
             String entityType = entity.getClass().getSimpleName();
             eventPublisher.publishEvent(new AuditEvent(
@@ -36,7 +37,7 @@ public class AuditInterceptor implements Interceptor {
     }
 
     @Override
-    public void onDelete(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
+    public void onRemove(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
         if (entity instanceof Auditable) {
             String entityType = entity.getClass().getSimpleName();
             eventPublisher.publishEvent(new AuditEvent(

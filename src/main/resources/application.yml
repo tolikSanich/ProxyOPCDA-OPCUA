@@ -23,9 +23,9 @@ spring:
           time_zone: UTC
 
   flyway:
-    enabled: true
+    enabled: false
     locations: classpath:db/migration
-    baseline-on-migrate: true
+    baseline-on-migrate: false`
 
   # Security (Базовая настройка, будет доработана в SecurityConfig)
   security:

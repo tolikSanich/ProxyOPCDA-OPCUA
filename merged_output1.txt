@@ -2,6 +2,7 @@ package com.opcproxy;
 
 import com.vaadin.flow.theme.aura.Aura;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
@@ -10,6 +11,7 @@ import com.vaadin.flow.component.page.AppShellConfigurator;
 import com.vaadin.flow.component.page.Push;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.security.Security;
 
@@ -19,7 +21,7 @@ import java.security.Security;
 @StyleSheet(Aura.STYLESHEET)
 @StyleSheet("styles.css") // Your custom styles
 @Push
-public class Application implements AppShellConfigurator {
+public class Application implements AppShellConfigurator, CommandLineRunner {
 
     static {
         // Убираем старую версию провайдера, если она где-то загрузилась
@@ -29,9 +31,17 @@ public class Application implements AppShellConfigurator {
     }
 
     public static void main(String[] args) {
+
         SpringApplication.run(Application.class, args);
     }
 
+    @Override
+    public void run(String... args) throws Exception {
+        BCryptPasswordEncoder encoder = new BCryptPasswordEncoder(10);
+        System.out.println("admin:    " + encoder.encode("admin"));
+        System.out.println("operator: " + encoder.encode("operator"));
+
+    }
 }
 
 ============================================================
@@ -759,58 +769,73 @@ public class OpcUaConfig {
 
 package com.opcproxy.config;
 
+import com.opcproxy.persistence.repository.UserAccountRepository;
 import com.opcproxy.ui.views.LoginView;
 import com.vaadin.flow.spring.security.VaadinSecurityConfigurer;
+import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetailsService;
-import org.springframework.security.crypto.password.NoOpPasswordEncoder;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
+
+import java.util.Collections;
 
 @Configuration
 @EnableMethodSecurity
+@RequiredArgsConstructor
 public class SecurityConfig {
+
+    private final UserAccountRepository userRepository;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
-                // API v1: те же пользователи, HTTP Basic (демо-стенд; прод — в бэклоге)
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/api/v1/**").authenticated()
                         .requestMatchers("/swagger-ui/**", "/swagger-ui.html",
                                 "/v3/api-docs/**").permitAll()
                 )
-                // HTTP Basic для API (браузерный UI продолжает использовать form-login Vaadin)
                 .httpBasic(Customizer.withDefaults())
-                // Vaadin: form-login, CSRF для UI и пр.
                 .with(VaadinSecurityConfigurer.vaadin(),
                         vaadinSecurity -> vaadinSecurity.loginView(LoginView.class));
-
         return http.build();
     }
 
+    /**
+     * UserDetailsService на основе БД (ТЗ §7.3).
+     * Читает пользователей из таблицы user_account.
+     */
     @Bean
     public UserDetailsService userDetailsService() {
-        var user = User.builder()
-                .username("admin")
-                .password("admin")
-                .roles("ADMIN", "USER")
-                .build();
-        return new InMemoryUserDetailsManager(user);
+        return username -> {
+            var user = userRepository.findByUsername(username)
+                    .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+
+            if (!user.getEnabled()) {
+                throw new UsernameNotFoundException("User is disabled: " + username);
+            }
+
+            return new User(
+                    user.getUsername(),
+                    user.getPasswordHash(),
+                    user.getEnabled(),
+                    true, true, true,
+                    Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + user.getRole().name()))
+            );
+        };
     }
 
     @Bean
-    @SuppressWarnings("deprecation")
     public PasswordEncoder passwordEncoder() {
-        // Для локальной разработки: NoOp, пароль "admin" принимается как есть.
-        // БЭКЛОГ (прод): BCrypt + вынос пользователей в БД (ТЗ §7.3).
-        return NoOpPasswordEncoder.getInstance();
+        return new BCryptPasswordEncoder(10);
     }
 }
 ============================================================
@@ -3555,17 +3580,33 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "user_account")
 public class UserAccount implements Auditable {
-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     @EqualsAndHashCode.Include
     private Long id;
-    @Column(nullable = false, unique = true) private String username;
-    @Column(name = "password_hash", nullable = false) private String passwordHash;
-    @Enumerated(EnumType.STRING) @Column(nullable = false) private UserRole role = UserRole.USER;
-    @Column(nullable = false) private Boolean enabled = true;
-    @Column(name = "created_at", updatable = false) private LocalDateTime createdAt;
-    @Column(name = "updated_at") private LocalDateTime updatedAt;
-    @PrePersist protected void onCreate() { createdAt = updatedAt = LocalDateTime.now(); }
-    @PreUpdate protected void onUpdate() { updatedAt = LocalDateTime.now(); }
+    @Column(nullable = false, unique = true)
+    private String username;
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private UserRole role = UserRole.ROLE_USER;
+    @Column(nullable = false)
+    private Boolean enabled = true;
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
 }
 ============================================================
 
@@ -3596,7 +3637,7 @@ public enum SourceType {
 package com.opcproxy.persistence.enums;
 
 public enum UserRole {
-    ADMIN, USER
+    ROLE_ADMIN, ROLE_USER
 }
 
 ============================================================
@@ -3702,12 +3743,16 @@ package com.opcproxy.persistence.repository;
 
 import com.opcproxy.persistence.entity.UserAccount;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 import java.util.Optional;
 
 @Repository
 public interface UserAccountRepository extends JpaRepository<UserAccount, Long> {
     Optional<UserAccount> findByUsername(String username);
+
+    @Query("select (count(u) > 0) from UserAccount u where u.username = ?1")
+    boolean existsByUsername(String username);
 }
 ============================================================
 
@@ -3778,6 +3823,7 @@ public class CsvApiController {
 package com.opcproxy.rest;
 
 import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.opcua.OpcUaServerManager;
 import com.opcproxy.persistence.entity.IntervalProfile;
@@ -3802,6 +3848,8 @@ import org.springframework.web.bind.annotation.*;
 import java.net.URI;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Optional;
+
 @Slf4j
 @io.swagger.v3.oas.annotations.tags.Tag(                          // <-- FQ-имя аннотации
         name = "Gateway API",
@@ -3866,6 +3914,7 @@ public class GatewayApiController {
                         connectionService.getErrorCount(c.getId())))
                 .toList();
     }
+
 
     @Operation(summary = "Подключение по id")
     @GetMapping("/connections/{id}")
@@ -4029,6 +4078,63 @@ public class GlobalExceptionHandler {
 }
 ============================================================
 
+package com.opcproxy.rest;
+
+import com.opcproxy.ui.services.SettingsService;
+import io.swagger.v3.oas.annotations.Operation;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+/**
+ * REST API для управления настройками (ТЗ §5.9.3).
+ */
+@Slf4j
+@io.swagger.v3.oas.annotations.tags.Tag(
+        name = "Settings API",
+        description = "Управление настройками системы (ТЗ §5.9.3)")
+@RestController
+@RequestMapping("/api/v1/settings")
+@RequiredArgsConstructor
+public class SettingsApiController {
+
+    private final SettingsService settingsService;
+
+    @Operation(summary = "Получить настройки секции")
+    @GetMapping("/{section}")
+    public ResponseEntity<Map<String, String>> getSettings(@PathVariable String section) {
+        Map<String, String> settings = switch (section.toLowerCase()) {
+            case "opcua" -> settingsService.getOpcUaSettings();
+            case "mqtt" -> settingsService.getMqttSettings();
+            case "opcda" -> settingsService.getOpcDaSettings();
+            default -> settingsService.getSettings(section);
+        };
+        return ResponseEntity.ok(settings);
+    }
+
+    @Operation(summary = "Сохранить настройки секции")
+    @PutMapping("/{section}")
+    public ResponseEntity<Void> saveSettings(
+            @PathVariable String section,
+            @RequestBody Map<String, String> settings) {
+        settingsService.saveSettings(section, settings);
+        return ResponseEntity.ok().build();
+    }
+
+    @Operation(summary = "Удалить настройку")
+    @DeleteMapping("/{section}/{key}")
+    public ResponseEntity<Void> deleteSetting(
+            @PathVariable String section,
+            @PathVariable String key) {
+        settingsService.deleteSetting(section + "." + key);
+        return ResponseEntity.noContent().build();
+    }
+}
+============================================================
+
 package com.opcproxy.rest.dto;
 
 import com.opcproxy.opcda.ConnectionState;
@@ -4078,6 +4184,49 @@ public final class RestDtos {
             List<BrowseNodeDto> children
     ) {
 
+    }
+}
+============================================================
+
+package com.opcproxy.security;
+
+import com.opcproxy.persistence.entity.UserAccount;
+import com.opcproxy.persistence.repository.UserAccountRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+
+/**
+ * Кастомный UserDetailsService на основе БД (ТЗ §7.3).
+ */
+@Service
+@RequiredArgsConstructor
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserAccountRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        UserAccount user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+
+        if (!user.getEnabled()) {
+            throw new UsernameNotFoundException("User is disabled: " + username);
+        }
+
+        return new User(
+                user.getUsername(),
+                user.getPasswordHash(),
+                user.getEnabled(),
+                true, true, true,
+                Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + user.getRole().name()))
+        );
     }
 }
 ============================================================
@@ -4355,14 +4504,45 @@ public class MainLayout extends AppLayout implements RouterLayout {
         // В методе createDrawer() добавьте:
         nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
         // В следующих этапах добавим сюда остальные вьюшки:
-        // nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
-        // nav.addItem(new SideNavItem("Tags", TagsView.class));
         // Внутри метода createDrawer() класса MainLayout.java
         nav.addItem(new SideNavItem("Tags", TagsView.class));
+        nav.addItem(new SideNavItem("Browse", BrowseView.class)); //
         nav.addItem(new SideNavItem("Servers & Tags", MasterDetailView.class));
         nav.addItem(new SideNavItem("Import/Export", ImportExportView.class));
+        nav.addItem(new SideNavItem("Calculations", CalcView.class)); //
+        nav.addItem(new SideNavItem("Settings", SettingsView.class)); //
+        nav.addItem(new SideNavItem("Users", UsersView.class)); //
         drawerLayout.add(nav);
         addToDrawer(drawerLayout);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.opcda.OpcDaConnectionManager;
+import com.opcproxy.rest.dto.RestDtos.BrowseNodeDto;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import java.util.Collections;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class BrowseService {
+    private final OpcDaConnectionManager connectionManager;
+
+    public List<BrowseNodeDto> getNodes(Long connectionId, BrowseNodeDto parent) {
+        try {
+            // Если parent null, получаем корни
+            if (parent == null) {
+                return connectionManager.browse(connectionId);
+            }
+            // Если parent задан, ищем его детей
+            return parent.children();
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
     }
 }
 ============================================================
@@ -4705,6 +4885,131 @@ public class IntervalProfileService {
 
 package com.opcproxy.ui.services;
 
+import com.opcproxy.persistence.entity.SystemSetting;
+import com.opcproxy.persistence.repository.SystemSettingRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Сервис управления настройками системы (ТЗ §5.8.3.7, §5.9.3).
+ * Хранит настройки в таблице system_setting (key-value).
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SettingsService {
+
+    private final SystemSettingRepository repository;
+
+    /**
+     * Получить все настройки указанной секции.
+     */
+    public Map<String, String> getSettings(String section) {
+        List<SystemSetting> settings = repository.findAll();
+        Map<String, String> result = new HashMap<>();
+
+        String prefix = section + ".";
+        for (SystemSetting setting : settings) {
+            if (setting.getKey().startsWith(prefix)) {
+                String key = setting.getKey().substring(prefix.length());
+                result.put(key, setting.getValue());
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Получить конкретную настройку.
+     */
+    public Optional<String> getSetting(String key) {
+        return repository.findById(key).map(SystemSetting::getValue);
+    }
+
+    /**
+     * Сохранить настройки секции (merge).
+     */
+    @Transactional
+    public void saveSettings(String section, Map<String, String> settings) {
+        for (Map.Entry<String, String> entry : settings.entrySet()) {
+            String fullKey = section + "." + entry.getKey();
+            SystemSetting setting = repository.findById(fullKey)
+                    .orElse(new SystemSetting());
+            setting.setKey(fullKey);
+            setting.setValue(entry.getValue());
+            repository.save(setting);
+        }
+        log.info("Settings saved for section '{}': {} keys", section, settings.size());
+    }
+
+    /**
+     * Удалить настройку.
+     */
+    @Transactional
+    public void deleteSetting(String key) {
+        repository.deleteById(key);
+        log.info("Setting deleted: {}", key);
+    }
+
+    /**
+     * Получить настройки OPC UA.
+     */
+    public Map<String, String> getOpcUaSettings() {
+        Map<String, String> defaults = new HashMap<>();
+        defaults.put("port", "4840");
+        defaults.put("hostname", "localhost");
+        defaults.put("enabledPolicies", "None,Basic256Sha256");
+        defaults.put("trustAllClients", "true");
+        defaults.put("defaultSamplingIntervalMs", "500");
+
+        Map<String, String> stored = getSettings("opcua");
+        defaults.putAll(stored);
+        return defaults;
+    }
+
+    /**
+     * Получить настройки MQTT.
+     */
+    public Map<String, String> getMqttSettings() {
+        Map<String, String> defaults = new HashMap<>();
+        defaults.put("enabled", "false");
+        defaults.put("broker", "tcp://localhost:1883");
+        defaults.put("baseTopic", "gateway/default");
+        defaults.put("qos", "1");
+        defaults.put("retain", "false");
+        defaults.put("configRefreshMs", "5000");
+
+        Map<String, String> stored = getSettings("mqtt");
+        defaults.putAll(stored);
+        return defaults;
+    }
+
+    /**
+     * Получить настройки OPC DA.
+     */
+    public Map<String, String> getOpcDaSettings() {
+        Map<String, String> defaults = new HashMap<>();
+        defaults.put("defaultRefreshPeriodMs", "1000");
+        defaults.put("reconnectIntervalMs", "5000");
+        defaults.put("maxConnections", "10");
+        defaults.put("connectionTimeoutMs", "10000");
+
+        Map<String, String> stored = getSettings("opcda");
+        defaults.putAll(stored);
+        return defaults;
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
 import com.opcproxy.calc.SpelCalcEngine;
 import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.persistence.repository.TagRepository;
@@ -4799,6 +5104,768 @@ public class TagService {
             tagRegistry.updateTagValue(tag.getId(), null, "Bad_Disabled", java.time.Instant.now());
         }
         return true;
+    }
+}
+============================================================
+
+package com.opcproxy.ui.services;
+
+import com.opcproxy.persistence.entity.UserAccount;
+import com.opcproxy.persistence.enums.UserRole;
+import com.opcproxy.persistence.repository.UserAccountRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * Сервис управления пользователями (ТЗ §5.8.5, §7.3).
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserAccountRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+
+    public List<UserAccount> findAll() {
+        return userRepository.findAll();
+    }
+
+    public Optional<UserAccount> findById(Long id) {
+        return userRepository.findById(id);
+    }
+
+    public Optional<UserAccount> findByUsername(String username) {
+        return userRepository.findByUsername(username);
+    }
+
+    public boolean existsByUsername(String username) {
+        return userRepository.existsByUsername(username);
+    }
+
+    @Transactional
+    public UserAccount save(UserAccount user, String rawPassword) {
+        // Проверка уникальности имени
+        if (user.getId() == null && existsByUsername(user.getUsername())) {
+            throw new IllegalArgumentException("Username already exists: " + user.getUsername());
+        }
+
+        // Логика хэширования пароля
+        if (rawPassword != null && !rawPassword.isBlank()) {
+            // Новый пароль введён — хэшируем
+            user.setPasswordHash(passwordEncoder.encode(rawPassword));
+            log.debug("Password hashed for user: {}", user.getUsername());
+        } else if (user.getId() != null) {
+            // Редактирование без изменения пароля — оставляем старый хэш
+            userRepository.findById(user.getId())
+                    .ifPresent(old -> user.setPasswordHash(old.getPasswordHash()));
+        } else {
+            // Новый пользователь без пароля — ошибка
+            throw new IllegalArgumentException("Password is required for new user");
+        }
+
+        UserAccount saved = userRepository.save(user);
+        log.info("User saved: {} (role={})", saved.getUsername(), saved.getRole());
+        return saved;
+    }
+
+    @Transactional
+    public void delete(Long id) {
+        UserAccount user = userRepository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("User not found: " + id));
+
+        if (user.getRole() == UserRole.ROLE_ADMIN) {
+            long adminCount = userRepository.findAll().stream()
+                    .filter(u -> u.getRole() == UserRole.ROLE_ADMIN && u.getEnabled())
+                    .count();
+            if (adminCount <= 1) {
+                throw new IllegalStateException("Cannot delete last admin user");
+            }
+        }
+
+        userRepository.deleteById(id);
+        log.info("User deleted: {}", user.getUsername());
+    }
+
+    @Transactional
+    public void setEnabled(Long id, boolean enabled) {
+        userRepository.findById(id).ifPresent(user -> {
+            user.setEnabled(enabled);
+            userRepository.save(user);
+            log.info("User {} {}", user.getUsername(), enabled ? "enabled" : "disabled");
+        });
+    }
+
+    @Transactional
+    public void changePassword(Long id, String newPassword) {
+        userRepository.findById(id).ifPresent(user -> {
+            user.setPasswordHash(passwordEncoder.encode(newPassword));
+            userRepository.save(user);
+            log.info("Password changed for user: {}", user.getUsername());
+        });
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.calc.CalcDependencyValidator;
+import com.opcproxy.opcda.OpcDaConnectionManager;
+import com.opcproxy.persistence.entity.OpcDaConnection;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.DataType;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.rest.dto.RestDtos.BrowseNodeDto;
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.ConnectionService;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.combobox.ComboBox;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.component.treegrid.TreeGrid;
+import com.vaadin.flow.data.provider.hierarchy.TreeData;
+import com.vaadin.flow.data.provider.hierarchy.TreeDataProvider;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Экран браузинга пространства имён OPC DA-сервера (ТЗ §5.8.3.4).
+ */
+@Slf4j
+@PageTitle("OPC DA Browse")
+@Route(value = "browse", layout = MainLayout.class)
+@PermitAll
+public class BrowseView extends VerticalLayout {
+
+    private final ConnectionService connectionService;
+    private final OpcDaConnectionManager connectionManager;
+    private final TagService tagService;
+    private final TagDialog tagDialog;
+
+    private final ComboBox<OpcDaConnection> connectionBox = new ComboBox<>("OPC DA Connection");
+    private final TextField searchField = new TextField("Search");
+    private final Button refreshButton = new Button("Refresh", new Icon(VaadinIcon.REFRESH));
+    private final Button addTagButton = new Button("Add as Tag", new Icon(VaadinIcon.PLUS));
+
+    private final TreeGrid<BrowseNodeDto> treeGrid = new TreeGrid<>();
+    private TreeData<BrowseNodeDto> treeData = new TreeData<>();
+
+    private OpcDaConnection selectedConnection;
+    private List<BrowseNodeDto> currentBrowseResult = new ArrayList<>();
+
+    public BrowseView(ConnectionService connectionService,
+                      OpcDaConnectionManager connectionManager,
+                      TagService tagService,
+                      OpcDaConnectionRepository connectionRepository,
+                      IntervalProfileRepository profileRepository,
+                      CalcDependencyValidator calcValidator) {
+        this.connectionService = connectionService;
+        this.connectionManager = connectionManager;
+        this.tagService = tagService;
+
+        // Инициализируем TagDialog вручную (не как Spring @Bean), чтобы избежать проблем с областью видимости (scope)
+        this.tagDialog = new TagDialog(
+                tagService,
+                connectionRepository,
+                calcValidator,
+                () -> Notification.show("Tag added successfully", 2000, Notification.Position.BOTTOM_END),
+                profileRepository
+        );
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setSizeFull();
+
+        createHeader();
+        createControls();
+        createTreeGrid();
+
+        refreshConnections();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("OPC DA Browser");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+        add(title);
+    }
+
+    private void createControls() {
+        connectionBox.setItems(connectionService.findAll());
+        connectionBox.setItemLabelGenerator(OpcDaConnection::getName);
+        connectionBox.setPlaceholder("Select OPC DA connection...");
+        connectionBox.setWidth("300px");
+        connectionBox.addValueChangeListener(e -> {
+            selectedConnection = e.getValue();
+            if (selectedConnection != null) {
+                loadBrowseData();
+            } else {
+                clearTree();
+            }
+        });
+
+        searchField.setPlaceholder("Search by name or ItemID...");
+        searchField.setClearButtonVisible(true);
+        searchField.setWidth("300px");
+        searchField.addValueChangeListener(e -> applyFilter(e.getValue()));
+
+        refreshButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        refreshButton.addClickListener(e -> refreshBrowse());
+        refreshButton.setEnabled(false);
+
+        addTagButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addTagButton.addClickListener(e -> addSelectedAsTag());
+        addTagButton.setEnabled(false);
+
+        HorizontalLayout controls = new HorizontalLayout(
+                connectionBox, searchField, refreshButton, addTagButton
+        );
+        controls.setWidthFull();
+        controls.setAlignItems(FlexComponent.Alignment.END);
+        controls.expand(searchField);
+
+        add(controls);
+    }
+
+    private void createTreeGrid() {
+        treeGrid.setWidthFull();
+        treeGrid.setHeight("600px");
+
+        treeGrid.addColumn(BrowseNodeDto::name)
+                .setHeader("Name")
+                .setFlexGrow(2)
+                .setSortable(true);
+
+        treeGrid.addColumn(node -> node.itemId() != null ? node.itemId() : "—")
+                .setHeader("ItemID")
+                .setFlexGrow(2)
+                .setSortable(true);
+
+        treeGrid.addComponentColumn(node -> {
+                    Span badge = new Span(node.isBranch() ? "Branch" : "Leaf");
+                    badge.addClassNames(
+                            LumoUtility.Padding.Horizontal.SMALL,
+                            LumoUtility.Padding.Vertical.XSMALL,
+                            LumoUtility.BorderRadius.MEDIUM,
+                            LumoUtility.FontSize.XSMALL,
+                            LumoUtility.FontWeight.BOLD
+                    );
+                    if (node.isBranch()) {
+                        badge.getStyle().set("background-color", "var(--lumo-primary-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-primary-color)");
+                    } else {
+                        badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-success-color)");
+                    }
+                    return badge;
+                })
+                .setHeader("Type")
+                .setFlexGrow(1);
+
+        treeGrid.setSelectionMode(Grid.SelectionMode.SINGLE);
+        treeGrid.addSelectionListener(e -> {
+            BrowseNodeDto selected = e.getFirstSelectedItem().orElse(null);
+            addTagButton.setEnabled(selected != null && !selected.isBranch());
+        });
+
+        treeGrid.setDataProvider(new TreeDataProvider<>(treeData));
+        add(treeGrid);
+    }
+
+    private void refreshConnections() {
+        connectionBox.setItems(connectionService.findAll());
+    }
+
+    private void loadBrowseData() {
+        if (selectedConnection == null) return;
+
+        try {
+            Notification.show("Loading browse data...", 2000, Notification.Position.MIDDLE);
+            currentBrowseResult = connectionManager.browse(selectedConnection.getId());
+            buildTreeData(currentBrowseResult);
+            refreshButton.setEnabled(true);
+            Notification.show("Loaded " + countLeaves(currentBrowseResult) + " tags",
+                    2000, Notification.Position.BOTTOM_END);
+        } catch (Exception e) {
+            log.error("Failed to browse connection {}: {}", selectedConnection.getName(), e.getMessage());
+            Notification.show("Error: " + e.getMessage(), 5000, Notification.Position.MIDDLE);
+            clearTree();
+        }
+    }
+
+    private void refreshBrowse() {
+        if (selectedConnection == null) return;
+        connectionManager.invalidateBrowseCache(selectedConnection.getId());
+        loadBrowseData();
+    }
+
+    private void buildTreeData(List<BrowseNodeDto> roots) {
+        treeData = new TreeData<>();
+        for (BrowseNodeDto root : roots) {
+            addRecursive(treeData, root, null);
+        }
+        treeGrid.setDataProvider(new TreeDataProvider<>(treeData));
+    }
+
+    private void addRecursive(TreeData<BrowseNodeDto> treeData, BrowseNodeDto node, BrowseNodeDto parent) {
+        treeData.addItem(parent, node);
+        if (node.children() != null && !node.children().isEmpty()) {
+            for (BrowseNodeDto child : node.children()) {
+                addRecursive(treeData, child, node);
+            }
+        }
+    }
+
+    private void clearTree() {
+        treeData = new TreeData<>();
+        treeGrid.setDataProvider(new TreeDataProvider<>(treeData));
+        refreshButton.setEnabled(false);
+        addTagButton.setEnabled(false);
+        currentBrowseResult = new ArrayList<>();
+    }
+
+    private void applyFilter(String filterText) {
+        if (filterText == null || filterText.isBlank()) {
+            buildTreeData(currentBrowseResult);
+            return;
+        }
+
+        String lowerFilter = filterText.toLowerCase();
+        Set<BrowseNodeDto> matchingNodes = new HashSet<>();
+        Set<BrowseNodeDto> parentNodes = new HashSet<>();
+
+        for (BrowseNodeDto root : currentBrowseResult) {
+            collectMatching(root, lowerFilter, matchingNodes, parentNodes, null);
+        }
+
+        TreeData<BrowseNodeDto> filteredData = new TreeData<>();
+        for (BrowseNodeDto root : currentBrowseResult) {
+            if (matchingNodes.contains(root) || parentNodes.contains(root)) {
+                addFilteredRecursive(filteredData, root, null, lowerFilter, matchingNodes, parentNodes);
+            }
+        }
+
+        treeGrid.setDataProvider(new TreeDataProvider<>(filteredData));
+    }
+
+    private void collectMatching(BrowseNodeDto node, String filter,
+                                 Set<BrowseNodeDto> matching, Set<BrowseNodeDto> parents,
+                                 BrowseNodeDto parent) {
+        boolean matches = (node.name() != null && node.name().toLowerCase().contains(filter)) ||
+                (node.itemId() != null && node.itemId().toLowerCase().contains(filter));
+
+        if (matches) {
+            matching.add(node);
+            BrowseNodeDto current = parent;
+            while (current != null) {
+                parents.add(current);
+                current = findParent(current, currentBrowseResult, null);
+            }
+        }
+
+        if (node.children() != null) {
+            for (BrowseNodeDto child : node.children()) {
+                collectMatching(child, filter, matching, parents, node);
+            }
+        }
+    }
+
+    private BrowseNodeDto findParent(BrowseNodeDto target, List<BrowseNodeDto> nodes, BrowseNodeDto parent) {
+        for (BrowseNodeDto node : nodes) {
+            if (node.equals(target)) {
+                return parent;
+            }
+            if (node.children() != null) {
+                BrowseNodeDto found = findParent(target, node.children(), node);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private void addFilteredRecursive(TreeData<BrowseNodeDto> treeData, BrowseNodeDto node,
+                                      BrowseNodeDto parent, String filter,
+                                      Set<BrowseNodeDto> matching, Set<BrowseNodeDto> parents) {
+        treeData.addItem(parent, node);
+        if (node.children() != null) {
+            for (BrowseNodeDto child : node.children()) {
+                if (matching.contains(child) || parents.contains(child)) {
+                    addFilteredRecursive(treeData, child, node, filter, matching, parents);
+                }
+            }
+        }
+    }
+
+    private void addSelectedAsTag() {
+        BrowseNodeDto selected = treeGrid.getSelectedItems().stream().findFirst().orElse(null);
+        if (selected == null || selected.isBranch() || selectedConnection == null) {
+            Notification.show("Select a leaf node first", 2000, Notification.Position.MIDDLE);
+            return;
+        }
+
+        Tag newTag = new Tag();
+        newTag.setName(generateUniqueTagName(selected.name()));
+        newTag.setSourceType(SourceType.DA);
+        newTag.setConnection(selectedConnection);
+        newTag.setSourceItemId(selected.itemId());
+        newTag.setDataType(DataType.STRING);
+        newTag.setEnabled(true);
+
+        tagDialog.edit(newTag);
+    }
+
+    private String generateUniqueTagName(String baseName) {
+        String name = baseName;
+        int counter = 1;
+        while (tagService.existsByName(name)) {
+            name = baseName + "_" + counter;
+            counter++;
+        }
+        return name;
+    }
+
+    private int countLeaves(List<BrowseNodeDto> nodes) {
+        int count = 0;
+        for (BrowseNodeDto node : nodes) {
+            if (!node.isBranch()) {
+                count++;
+            }
+            if (node.children() != null) {
+                count += countLeaves(node.children());
+            }
+        }
+        return count;
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.calc.CalcDependencyValidator;
+import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.persistence.enums.SourceType;
+import com.opcproxy.persistence.repository.IntervalProfileRepository;
+import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
+import com.opcproxy.tags.TagRegistry;
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.TagService;
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.DetachEvent;
+import com.vaadin.flow.component.UI;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Hr;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.data.value.ValueChangeMode;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.shared.Registration;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Экран работы с вычисляемыми тегами (ТЗ §5.8.3.5).
+ */
+@Slf4j
+@PageTitle("Calculations")
+@Route(value = "calc", layout = MainLayout.class)
+@PermitAll
+public class CalcView extends VerticalLayout {
+
+    private final TagService tagService;
+    private final TagRegistry tagRegistry;
+    private final CalcDependencyValidator calcValidator;
+
+    private final Grid<Tag> grid = new Grid<>();
+    private final TextField filterField = new TextField("Фильтр по имени или формуле");
+
+    private final Map<Long, Span> valueSpans = new ConcurrentHashMap<>();
+    private final Map<Long, Span> qualitySpans = new ConcurrentHashMap<>();
+    private Registration pollRegistration;
+    private final TagDialog tagDialog;
+
+    public CalcView(TagService tagService,
+                    TagRegistry tagRegistry,
+                    CalcDependencyValidator calcValidator,
+                    OpcDaConnectionRepository connectionRepository,
+                    IntervalProfileRepository profileRepository) {
+        this.tagService = tagService;
+        this.tagRegistry = tagRegistry;
+        this.calcValidator = calcValidator;
+
+        // Инициализируем диалог с реальными репозиториями, чтобы избежать NPE в TagDialog
+        this.tagDialog = new TagDialog(
+                tagService,
+                connectionRepository,
+                calcValidator,
+                this::refreshGrid,
+                profileRepository
+        );
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setSizeFull();
+
+        createHeader();
+        createFilters();
+        createGrid();
+        refreshGrid();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("Вычисляемые теги (Calculation Engine)");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+
+        Button addButton = new Button("Добавить CALC-тег", new Icon(VaadinIcon.PLUS_CIRCLE));
+        addButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addButton.addClickListener(e -> {
+            Tag newTag = new Tag();
+            newTag.setSourceType(SourceType.CALC);
+            tagDialog.edit(newTag);
+        });
+
+        Button validateAllButton = new Button("Проверить все формулы", new Icon(VaadinIcon.CHECK));
+        validateAllButton.addThemeVariants(ButtonVariant.LUMO_CONTRAST);
+        validateAllButton.addClickListener(e -> validateAllFormulas());
+
+        HorizontalLayout header = new HorizontalLayout(title, addButton, validateAllButton);
+        header.setWidthFull();
+        header.setAlignItems(FlexComponent.Alignment.CENTER);
+        header.expand(title);
+        add(header);
+        add(new Hr());
+    }
+
+    private void createFilters() {
+        filterField.setPlaceholder("Введите имя тега или часть формулы...");
+        filterField.setClearButtonVisible(true);
+        filterField.setValueChangeMode(ValueChangeMode.LAZY);
+        filterField.setValueChangeTimeout(300);
+        filterField.addValueChangeListener(e -> refreshGrid());
+        filterField.setWidth("400px");
+        add(filterField);
+    }
+
+    private void createGrid() {
+        grid.setWidthFull();
+        grid.setHeight("100%");
+        grid.setSelectionMode(Grid.SelectionMode.NONE);
+
+        grid.addColumn(Tag::getName)
+                .setHeader("Имя тега")
+                .setFlexGrow(1)
+                .setSortable(true);
+
+        grid.addColumn(Tag::getExpression)
+                .setHeader("Выражение (SpEL)")
+                .setFlexGrow(2)
+                .setSortable(true)
+                .setRenderer(new com.vaadin.flow.data.renderer.ComponentRenderer<>(tag -> {
+                    Span span = new Span(tag.getExpression() != null ? tag.getExpression() : "—");
+                    span.getStyle().set("fontFamily", "var(--lumo-font-family-monospace)");
+                    span.getStyle().set("fontSize", "var(--lumo-font-size-s)");
+                    return span;
+                }));
+
+        grid.addColumn(tag -> {
+                    List<String> refs = calcValidator.extractRefs(tag.getExpression());
+                    return refs.isEmpty() ? "—" : String.join(", ", refs);
+                })
+                .setHeader("Зависимости")
+                .setFlexGrow(1);
+
+        grid.addComponentColumn(this::createValueSpan)
+                .setHeader("Значение")
+                .setFlexGrow(1);
+
+        grid.addComponentColumn(this::createQualityBadge)
+                .setHeader("Качество")
+                .setFlexGrow(1);
+
+        grid.addComponentColumn(this::createActions)
+                .setHeader("Действия")
+                .setFlexGrow(0)
+                .setWidth("120px");
+
+        add(grid);
+    }
+
+    private void validateAllFormulas() {
+        List<Tag> calcTags = tagService.findAll().stream()
+                .filter(t -> t.getSourceType() == SourceType.CALC)
+                .toList();
+
+        int validCount = 0;
+        int invalidCount = 0;
+        StringBuilder errorReport = new StringBuilder();
+
+        for (Tag tag : calcTags) {
+            var result = calcValidator.validate(tag);
+            if (result.ok()) {
+                validCount++;
+            } else {
+                invalidCount++;
+                errorReport.append("• ").append(tag.getName()).append(": ").append(String.join("; ", result.errors())).append("\n");
+            }
+        }
+
+        if (invalidCount == 0) {
+            Notification.show("Все " + validCount + " формул прошли валидацию успешно", 3000, Notification.Position.BOTTOM_END);
+        } else {
+            Notification.show("Найдено ошибок: " + invalidCount + ". Проверьте логи или исправьте теги.", 5000, Notification.Position.MIDDLE);
+            log.warn("Calc Validation Errors:\n{}", errorReport.toString());
+        }
+    }
+
+    private Span createValueSpan(Tag tag) {
+        Span span = new Span("—");
+        span.addClassNames(LumoUtility.FontSize.SMALL);
+        valueSpans.put(tag.getId(), span);
+        applyValue(tag.getId());
+        return span;
+    }
+
+    private Span createQualityBadge(Tag tag) {
+        Span span = new Span("Unknown");
+        span.addClassNames(
+                LumoUtility.Padding.Horizontal.SMALL,
+                LumoUtility.Padding.Vertical.XSMALL,
+                LumoUtility.BorderRadius.MEDIUM,
+                LumoUtility.FontSize.XSMALL,
+                LumoUtility.FontWeight.BOLD
+        );
+        qualitySpans.put(tag.getId(), span);
+        applyQuality(tag.getId());
+        return span;
+    }
+
+    private HorizontalLayout createActions(Tag tag) {
+        Button editBtn = new Button(new Icon(VaadinIcon.EDIT));
+        editBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+        editBtn.setTooltipText("Редактировать формулу");
+        editBtn.addClickListener(e -> tagService.findById(tag.getId()).ifPresent(tagDialog::edit));
+
+        HorizontalLayout layout = new HorizontalLayout(editBtn);
+        layout.setSpacing(false);
+        layout.setJustifyContentMode(FlexComponent.JustifyContentMode.CENTER);
+        return layout;
+    }
+
+    private void applyValue(Long tagId) {
+        Span span = valueSpans.get(tagId);
+        if (span == null) return;
+
+        String newText = tagRegistry.getTagValue(tagId)
+                .map(tv -> tv.getValue() != null ? String.valueOf(tv.getValue()) : "—")
+                .orElse("—");
+
+        if (!newText.equals(span.getText())) {
+            getUI().ifPresent(ui -> ui.access(() -> span.setText(newText)));
+        }
+    }
+
+    private void applyQuality(Long tagId) {
+        Span span = qualitySpans.get(tagId);
+        if (span == null) return;
+
+        String quality = tagRegistry.getTagValue(tagId)
+                .map(com.opcproxy.tags.TagRegistry.TagValue::getQuality)
+                .orElse("Bad_NotRegistered");
+
+        if (!quality.equals(span.getText())) {
+            getUI().ifPresent(ui -> ui.access(() -> {
+                span.setText(quality);
+                span.getStyle().set("color", getColorForQuality(quality));
+                span.getStyle().set("background-color", getBgColorForQuality(quality) + "20");
+            }));
+        }
+    }
+
+    private String getColorForQuality(String q) {
+        if (q.startsWith("Good")) return "var(--lumo-success-color)";
+        if (q.startsWith("Uncertain")) return "var(--lumo-warning-color)";
+        return "var(--lumo-error-color)";
+    }
+
+    private String getBgColorForQuality(String q) {
+        if (q.startsWith("Good")) return "var(--lumo-success-color)";
+        if (q.startsWith("Uncertain")) return "var(--lumo-warning-color)";
+        return "var(--lumo-error-color)";
+    }
+
+    private void refreshGrid() {
+        String filter = filterField.getValue() != null ? filterField.getValue().toLowerCase() : "";
+
+        List<Tag> filteredTags = tagService.findAll().stream()
+                .filter(t -> t.getSourceType() == SourceType.CALC)
+                .filter(t -> filter.isEmpty() ||
+                        (t.getName() != null && t.getName().toLowerCase().contains(filter)) ||
+                        (t.getExpression() != null && t.getExpression().toLowerCase().contains(filter)))
+                .collect(Collectors.toList());
+
+        valueSpans.clear();
+        qualitySpans.clear();
+        grid.setItems(filteredTags);
+    }
+
+    @Override
+    protected void onAttach(AttachEvent event) {
+        super.onAttach(event);
+        UI ui = event.getUI();
+        ui.setPollInterval(1000);
+        pollRegistration = ui.addPollListener(e -> {
+            valueSpans.keySet().forEach(this::applyValue);
+            qualitySpans.keySet().forEach(this::applyQuality);
+        });
+    }
+
+    @Override
+    protected void onDetach(DetachEvent event) {
+        if (pollRegistration != null) {
+            pollRegistration.remove();
+            pollRegistration = null;
+        }
+        event.getUI().setPollInterval(-1);
+        super.onDetach(event);
     }
 }
 ============================================================
@@ -6107,6 +7174,271 @@ public class MasterDetailView extends VerticalLayout {
 
 package com.opcproxy.ui.views;
 
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.SettingsService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.H3;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.tabs.Tab;
+import com.vaadin.flow.component.tabs.Tabs;
+import com.vaadin.flow.component.textfield.IntegerField;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.PermitAll;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Экран настроек системы (ТЗ §5.8.3.7).
+ * Вкладки: OPC UA, MQTT, OPC DA, Безопасность, Журналы.
+ */
+@Slf4j
+@PageTitle("Settings")
+@Route(value = "settings", layout = MainLayout.class)
+@PermitAll
+public class SettingsView extends VerticalLayout {
+
+    private final SettingsService settingsService;
+
+    private final Tabs tabs = new Tabs();
+    private final VerticalLayout content = new VerticalLayout();
+
+    // OPC UA
+    private final IntegerField opcUaPortField = new IntegerField("Port");
+    private final TextField opcUaHostnameField = new TextField("Hostname");
+    private final TextField opcUaPoliciesField = new TextField("Enabled Policies");
+    private final Checkbox opcUaTrustAllCheckbox = new Checkbox("Trust All Clients");
+    private final IntegerField opcUaSamplingField = new IntegerField("Default Sampling Interval (ms)");
+
+    // MQTT
+    private final Checkbox mqttEnabledCheckbox = new Checkbox("Enable MQTT");
+    private final TextField mqttBrokerField = new TextField("Broker URL");
+    private final TextField mqttBaseTopicField = new TextField("Base Topic");
+    private final IntegerField mqttQosField = new IntegerField("QoS");
+    private final Checkbox mqttRetainCheckbox = new Checkbox("Retain");
+    private final IntegerField mqttRefreshField = new IntegerField("Config Refresh (ms)");
+
+    // OPC DA
+    private final IntegerField opcDaRefreshField = new IntegerField("Default Refresh Period (ms)");
+    private final IntegerField opcDaReconnectField = new IntegerField("Reconnect Interval (ms)");
+    private final IntegerField opcDaMaxConnField = new IntegerField("Max Connections");
+    private final IntegerField opcDaTimeoutField = new IntegerField("Connection Timeout (ms)");
+
+    public SettingsView(SettingsService settingsService) {
+        this.settingsService = settingsService;
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setSizeFull();
+
+        createHeader();
+        createTabs();
+        loadSettings();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("System Settings");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+        add(title);
+    }
+
+    private void createTabs() {
+        Tab opcUaTab = new Tab("OPC UA");
+        Tab mqttTab = new Tab("MQTT");
+        Tab opcDaTab = new Tab("OPC DA");
+        Tab securityTab = new Tab("Security");
+        Tab logsTab = new Tab("Logs");
+
+        tabs.add(opcUaTab, mqttTab, opcDaTab, securityTab, logsTab);
+        tabs.addSelectedChangeListener(e -> {
+            Tab selected = tabs.getSelectedTab();
+            if (selected == opcUaTab) showOpcUaSettings();
+            else if (selected == mqttTab) showMqttSettings();
+            else if (selected == opcDaTab) showOpcDaSettings();
+            else if (selected == securityTab) showSecuritySettings();
+            else if (selected == logsTab) showLogsSettings();
+        });
+
+        add(tabs);
+        content.setSizeFull();
+        add(content);
+
+        // По умолчанию показываем OPC UA
+        showOpcUaSettings();
+    }
+
+    private void loadSettings() {
+        // OPC UA
+        Map<String, String> opcUa = settingsService.getOpcUaSettings();
+        opcUaPortField.setValue(Integer.parseInt(opcUa.getOrDefault("port", "4840")));
+        opcUaHostnameField.setValue(opcUa.getOrDefault("hostname", "localhost"));
+        opcUaPoliciesField.setValue(opcUa.getOrDefault("enabledPolicies", "None,Basic256Sha256"));
+        opcUaTrustAllCheckbox.setValue(Boolean.parseBoolean(opcUa.getOrDefault("trustAllClients", "true")));
+        opcUaSamplingField.setValue(Integer.parseInt(opcUa.getOrDefault("defaultSamplingIntervalMs", "500")));
+
+        // MQTT
+        Map<String, String> mqtt = settingsService.getMqttSettings();
+        mqttEnabledCheckbox.setValue(Boolean.parseBoolean(mqtt.getOrDefault("enabled", "false")));
+        mqttBrokerField.setValue(mqtt.getOrDefault("broker", "tcp://localhost:1883"));
+        mqttBaseTopicField.setValue(mqtt.getOrDefault("baseTopic", "gateway/default"));
+        mqttQosField.setValue(Integer.parseInt(mqtt.getOrDefault("qos", "1")));
+        mqttRetainCheckbox.setValue(Boolean.parseBoolean(mqtt.getOrDefault("retain", "false")));
+        mqttRefreshField.setValue(Integer.parseInt(mqtt.getOrDefault("configRefreshMs", "5000")));
+
+        // OPC DA
+        Map<String, String> opcDa = settingsService.getOpcDaSettings();
+        opcDaRefreshField.setValue(Integer.parseInt(opcDa.getOrDefault("defaultRefreshPeriodMs", "1000")));
+        opcDaReconnectField.setValue(Integer.parseInt(opcDa.getOrDefault("reconnectIntervalMs", "5000")));
+        opcDaMaxConnField.setValue(Integer.parseInt(opcDa.getOrDefault("maxConnections", "10")));
+        opcDaTimeoutField.setValue(Integer.parseInt(opcDa.getOrDefault("connectionTimeoutMs", "10000")));
+    }
+
+    private void showOpcUaSettings() {
+        content.removeAll();
+
+        H3 title = new H3("OPC UA Server Settings");
+
+        opcUaPortField.setMin(1024);
+        opcUaPortField.setMax(65535);
+        opcUaSamplingField.setMin(100);
+        opcUaSamplingField.setStep(100);
+
+        Button saveBtn = new Button("Save OPC UA Settings", new Icon(VaadinIcon.CHECK));
+        saveBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        saveBtn.addClickListener(e -> saveOpcUaSettings());
+
+        VerticalLayout layout = new VerticalLayout(title,
+                opcUaPortField, opcUaHostnameField, opcUaPoliciesField,
+                opcUaTrustAllCheckbox, opcUaSamplingField, saveBtn);
+        layout.setPadding(false);
+        content.add(layout);
+    }
+
+    private void showMqttSettings() {
+        content.removeAll();
+
+        H3 title = new H3("MQTT Publisher Settings");
+
+        mqttQosField.setMin(0);
+        mqttQosField.setMax(2);
+        mqttRefreshField.setMin(1000);
+        mqttRefreshField.setStep(1000);
+
+        Button saveBtn = new Button("Save MQTT Settings", new Icon(VaadinIcon.CHECK));
+        saveBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        saveBtn.addClickListener(e -> saveMqttSettings());
+
+        VerticalLayout layout = new VerticalLayout(title,
+                mqttEnabledCheckbox, mqttBrokerField, mqttBaseTopicField,
+                mqttQosField, mqttRetainCheckbox, mqttRefreshField, saveBtn);
+        layout.setPadding(false);
+        content.add(layout);
+    }
+
+    private void showOpcDaSettings() {
+        content.removeAll();
+
+        H3 title = new H3("OPC DA Connection Settings");
+
+        opcDaRefreshField.setMin(100);
+        opcDaRefreshField.setStep(100);
+        opcDaReconnectField.setMin(1000);
+        opcDaReconnectField.setStep(1000);
+        opcDaMaxConnField.setMin(1);
+        opcDaMaxConnField.setMax(100);
+        opcDaTimeoutField.setMin(1000);
+        opcDaTimeoutField.setStep(1000);
+
+        Button saveBtn = new Button("Save OPC DA Settings", new Icon(VaadinIcon.CHECK));
+        saveBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        saveBtn.addClickListener(e -> saveOpcDaSettings());
+
+        VerticalLayout layout = new VerticalLayout(title,
+                opcDaRefreshField, opcDaReconnectField, opcDaMaxConnField,
+                opcDaTimeoutField, saveBtn);
+        layout.setPadding(false);
+        content.add(layout);
+    }
+
+    private void showSecuritySettings() {
+        content.removeAll();
+
+        H3 title = new H3("Security Settings");
+        Span info = new Span("Security settings are managed via application.yml and Jasypt encryption.");
+        info.addClassNames(LumoUtility.FontSize.SMALL, LumoUtility.TextColor.SECONDARY);
+
+        VerticalLayout layout = new VerticalLayout(title, info);
+        layout.setPadding(false);
+        content.add(layout);
+    }
+
+    private void showLogsSettings() {
+        content.removeAll();
+
+        H3 title = new H3("Logging Settings");
+        Span info = new Span("Logging levels are configured in application.yml. Changes require application restart.");
+        info.addClassNames(LumoUtility.FontSize.SMALL, LumoUtility.TextColor.SECONDARY);
+
+        VerticalLayout layout = new VerticalLayout(title, info);
+        layout.setPadding(false);
+        content.add(layout);
+    }
+
+    private void saveOpcUaSettings() {
+        Map<String, String> settings = new HashMap<>();
+        settings.put("port", String.valueOf(opcUaPortField.getValue()));
+        settings.put("hostname", opcUaHostnameField.getValue());
+        settings.put("enabledPolicies", opcUaPoliciesField.getValue());
+        settings.put("trustAllClients", String.valueOf(opcUaTrustAllCheckbox.getValue()));
+        settings.put("defaultSamplingIntervalMs", String.valueOf(opcUaSamplingField.getValue()));
+
+        settingsService.saveSettings("opcua", settings);
+        Notification.show("OPC UA settings saved. Restart required for some changes.",
+                3000, Notification.Position.BOTTOM_END);
+    }
+
+    private void saveMqttSettings() {
+        Map<String, String> settings = new HashMap<>();
+        settings.put("enabled", String.valueOf(mqttEnabledCheckbox.getValue()));
+        settings.put("broker", mqttBrokerField.getValue());
+        settings.put("baseTopic", mqttBaseTopicField.getValue());
+        settings.put("qos", String.valueOf(mqttQosField.getValue()));
+        settings.put("retain", String.valueOf(mqttRetainCheckbox.getValue()));
+        settings.put("configRefreshMs", String.valueOf(mqttRefreshField.getValue()));
+
+        settingsService.saveSettings("mqtt", settings);
+        Notification.show("MQTT settings saved. Restart required for some changes.",
+                3000, Notification.Position.BOTTOM_END);
+    }
+
+    private void saveOpcDaSettings() {
+        Map<String, String> settings = new HashMap<>();
+        settings.put("defaultRefreshPeriodMs", String.valueOf(opcDaRefreshField.getValue()));
+        settings.put("reconnectIntervalMs", String.valueOf(opcDaReconnectField.getValue()));
+        settings.put("maxConnections", String.valueOf(opcDaMaxConnField.getValue()));
+        settings.put("connectionTimeoutMs", String.valueOf(opcDaTimeoutField.getValue()));
+
+        settingsService.saveSettings("opcda", settings);
+        Notification.show("OPC DA settings saved. Restart required for some changes.",
+                3000, Notification.Position.BOTTOM_END);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
 import com.opcproxy.calc.CalcDependencyValidator;
 import com.opcproxy.persistence.entity.IntervalProfile;
 import com.opcproxy.persistence.entity.OpcDaConnection;
@@ -6399,7 +7731,7 @@ public class TagDialog extends Dialog {
     public void edit(Tag tag) {
         if (tag == null) {
             currentTag = new Tag();
-            currentTag.setSourceType(SourceType.DA);   // дефолт — DA
+            currentTag.setSourceType(SourceType.DA);
             currentTag.setReadMode(ReadMode.ASYNC);
             currentTag.setRefreshPeriodMs(1000);
             currentTag.setEnabled(true);
@@ -6407,13 +7739,9 @@ public class TagDialog extends Dialog {
         } else {
             currentTag = tag;
         }
-
         binder.setBean(currentTag);
-        // Видимость выставляем ЯВНО по фактическому типу (надёжнее, чем ждать listener:
-        // при setBean listener сработает, но порядок/повторы не гарантированы)
         updateFieldVisibility(currentTag.getSourceType());
-
-        setHeaderTitle(tag == null ? "Add Tag" : "Edit Tag");
+        setHeaderTitle(tag == null || tag.getId() == null ? "Add Tag" : "Edit Tag");
         mqttDeadbandField.setVisible(Boolean.TRUE.equals(currentTag.getPublishMqtt()));
         open();
     }
@@ -6692,6 +8020,312 @@ public class TagsView extends VerticalLayout {
         List<Tag> tags = tagService.findAll();
         valueSpans.clear();          // старые Span больше не актуальны
         grid.setItems(tags);
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.persistence.entity.UserAccount;
+import com.opcproxy.persistence.enums.UserRole;
+import com.opcproxy.ui.services.UserService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.checkbox.Checkbox;
+import com.vaadin.flow.component.combobox.ComboBox;
+import com.vaadin.flow.component.dialog.Dialog;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.textfield.PasswordField;
+import com.vaadin.flow.component.textfield.TextField;
+import com.vaadin.flow.data.binder.Binder;
+import com.vaadin.flow.data.validator.StringLengthValidator;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class UserDialog extends Dialog {
+
+    private final UserService userService;
+    private final Runnable onSaveCallback;
+
+    private final TextField usernameField = new TextField("Username");
+    private final PasswordField passwordField = new PasswordField("Password");
+    private final ComboBox<UserRole> roleBox = new ComboBox<>("Role");
+    private final Checkbox enabledCheckbox = new Checkbox("Enabled");
+
+    private final Binder<UserAccount> binder = new Binder<>(UserAccount.class);
+    private UserAccount currentUser;
+
+    public UserDialog(UserService userService, Runnable onSaveCallback) {
+        this.userService = userService;
+        this.onSaveCallback = onSaveCallback;
+
+        setHeaderTitle("User Account");
+        setCloseOnOutsideClick(false);
+        setWidth("450px");
+
+        configureFields();
+        configureBinder();
+        buildLayout();
+    }
+
+    private void configureFields() {
+        usernameField.setRequired(true);
+        usernameField.setPlaceholder("e.g., admin, operator");
+
+        passwordField.setRequired(true);
+        passwordField.setPlaceholder("Min 6 characters");
+
+        roleBox.setItems(UserRole.values());
+        roleBox.setItemLabelGenerator(Enum::name);
+        roleBox.setRequired(true);
+
+        enabledCheckbox.setValue(true);
+    }
+
+    private void configureBinder() {
+        binder.forField(usernameField)
+                .withValidator(new StringLengthValidator("Username must be 3-50 characters", 3, 50))
+                .bind(UserAccount::getUsername, UserAccount::setUsername);
+
+        // ВАЖНО: НЕ биндим passwordField к entity, обрабатываем отдельно
+        binder.forField(roleBox)
+                .withValidator(v -> v != null, "Role is required")
+                .bind(UserAccount::getRole, UserAccount::setRole);
+
+        binder.bind(enabledCheckbox, UserAccount::getEnabled, UserAccount::setEnabled);
+    }
+
+    private void buildLayout() {
+        VerticalLayout layout = new VerticalLayout();
+        layout.setPadding(false);
+        layout.setSpacing(true);
+
+        usernameField.setWidthFull();
+        passwordField.setWidthFull();
+        roleBox.setWidthFull();
+        enabledCheckbox.setWidthFull();
+
+        layout.add(usernameField, passwordField, roleBox, enabledCheckbox);
+
+        Button saveButton = new Button("Save", e -> save());
+        saveButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+
+        Button cancelButton = new Button("Cancel", e -> close());
+        cancelButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+
+        HorizontalLayout buttons = new HorizontalLayout(cancelButton, saveButton);
+        buttons.setWidthFull();
+        buttons.setJustifyContentMode(FlexComponent.JustifyContentMode.END);
+
+        layout.add(buttons);
+        add(layout);
+    }
+
+    public void edit(UserAccount user) {
+        if (user == null) {
+            currentUser = new UserAccount();
+            currentUser.setRole(UserRole.ROLE_USER);
+            currentUser.setEnabled(true);
+        } else {
+            currentUser = user;
+        }
+
+        binder.setBean(currentUser);
+        passwordField.clear();
+        passwordField.setPlaceholder(user == null ? "Enter password" : "Leave empty to keep current");
+        setHeaderTitle(user == null ? "Add User" : "Edit User");
+        open();
+    }
+
+    private void save() {
+        // Валидация полей
+        if (!binder.validate().isOk()) {
+            Notification.show("Please fix validation errors", 2000, Notification.Position.MIDDLE);
+            return;
+        }
+
+        // Валидация пароля
+        String rawPassword = passwordField.getValue();
+        boolean isNewUser = currentUser.getId() == null;
+
+        if (isNewUser && (rawPassword == null || rawPassword.length() < 6)) {
+            Notification.show("Password must be at least 6 characters for new user", 3000, Notification.Position.MIDDLE);
+            return;
+        }
+
+        // Применяем значения из формы к entity
+        binder.writeBeanIfValid(currentUser);
+
+        try {
+            // Сохраняем с явной передачей пароля
+            userService.save(currentUser, rawPassword);
+            onSaveCallback.run();
+            close();
+            Notification.show("User saved successfully", 2000, Notification.Position.BOTTOM_END);
+        } catch (Exception e) {
+            log.error("Failed to save user", e);
+            Notification.show("Error: " + e.getMessage(), 3000, Notification.Position.MIDDLE);
+        }
+    }
+}
+============================================================
+
+package com.opcproxy.ui.views;
+
+import com.opcproxy.persistence.entity.UserAccount;
+import com.opcproxy.ui.MainLayout;
+import com.opcproxy.ui.services.UserService;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.button.ButtonVariant;
+import com.vaadin.flow.component.confirmdialog.ConfirmDialog;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.html.H2;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.icon.VaadinIcon;
+import com.vaadin.flow.component.notification.Notification;
+import com.vaadin.flow.component.orderedlayout.FlexComponent;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.router.PageTitle;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.LumoUtility;
+import jakarta.annotation.security.RolesAllowed;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+
+@Slf4j
+@PageTitle("User Management")
+@Route(value = "users", layout = MainLayout.class)
+@RolesAllowed("ADMIN")
+public class UsersView extends VerticalLayout {
+
+    private final UserService userService;
+    private final Grid<UserAccount> grid = new Grid<>();
+    private final UserDialog dialog;
+
+    public UsersView(UserService userService) {
+        this.userService = userService;
+        this.dialog = new UserDialog(userService, this::refreshGrid);
+
+        addClassNames(LumoUtility.Padding.MEDIUM, LumoUtility.Gap.MEDIUM);
+        setWidthFull();
+
+        createHeader();
+        createGrid();
+        refreshGrid();
+    }
+
+    private void createHeader() {
+        H2 title = new H2("User Management");
+        title.addClassNames(LumoUtility.Margin.Bottom.NONE);
+
+        Button addButton = new Button("Add User", new Icon(VaadinIcon.PLUS_CIRCLE));
+        addButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+        addButton.addClickListener(e -> dialog.edit(null));
+
+        Button refreshButton = new Button("Refresh", new Icon(VaadinIcon.REFRESH));
+        refreshButton.addThemeVariants(ButtonVariant.LUMO_TERTIARY);
+        refreshButton.addClickListener(e -> refreshGrid());
+
+        HorizontalLayout header = new HorizontalLayout(title, addButton, refreshButton);
+        header.setWidthFull();
+        header.setAlignItems(FlexComponent.Alignment.CENTER);
+        header.expand(title);
+        add(header);
+    }
+
+    private void createGrid() {
+        grid.setWidthFull();
+        grid.setHeight("500px");
+        grid.setSelectionMode(Grid.SelectionMode.SINGLE);
+
+        grid.addColumn(UserAccount::getUsername)
+                .setHeader("Username")
+                .setFlexGrow(2)
+                .setSortable(true);
+
+        grid.addColumn(user -> user.getRole().name())
+                .setHeader("Role")
+                .setFlexGrow(1);
+
+        grid.addComponentColumn(user -> {
+                    Span badge = new Span(user.getEnabled() ? "ACTIVE" : "DISABLED");
+                    badge.addClassNames(
+                            LumoUtility.Padding.Horizontal.SMALL,
+                            LumoUtility.Padding.Vertical.XSMALL,
+                            LumoUtility.BorderRadius.MEDIUM,
+                            LumoUtility.FontSize.XSMALL,
+                            LumoUtility.FontWeight.BOLD
+                    );
+                    if (user.getEnabled()) {
+                        badge.getStyle().set("background-color", "var(--lumo-success-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-success-color)");
+                    } else {
+                        badge.getStyle().set("background-color", "var(--lumo-error-contrast-color)");
+                        badge.getStyle().set("color", "var(--lumo-error-color)");
+                    }
+                    return badge;
+                })
+                .setHeader("Status")
+                .setFlexGrow(1);
+
+        grid.addComponentColumn(this::createActions)
+                .setHeader("Actions")
+                .setFlexGrow(0)
+                .setWidth("150px");
+
+        add(grid);
+    }
+
+    private HorizontalLayout createActions(UserAccount user) {
+        Button toggleBtn = new Button(user.getEnabled() ? "Disable" : "Enable");
+        toggleBtn.addThemeVariants(ButtonVariant.LUMO_SMALL,
+                user.getEnabled() ? ButtonVariant.LUMO_ERROR : ButtonVariant.LUMO_SUCCESS);
+        toggleBtn.addClickListener(e -> {
+            userService.setEnabled(user.getId(), !user.getEnabled());
+            refreshGrid();
+        });
+
+        Button editBtn = new Button(new Icon(VaadinIcon.EDIT));
+        editBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY);
+        editBtn.addClickListener(e -> dialog.edit(user));
+
+        Button deleteBtn = new Button(new Icon(VaadinIcon.TRASH));
+        deleteBtn.addThemeVariants(ButtonVariant.LUMO_SMALL, ButtonVariant.LUMO_TERTIARY, ButtonVariant.LUMO_ERROR);
+        deleteBtn.addClickListener(e -> confirmDelete(user));
+
+        HorizontalLayout layout = new HorizontalLayout(toggleBtn, editBtn, deleteBtn);
+        layout.setSpacing(false);
+        layout.setJustifyContentMode(FlexComponent.JustifyContentMode.CENTER);
+        return layout;
+    }
+
+    private void confirmDelete(UserAccount user) {
+        ConfirmDialog dialog = new ConfirmDialog();
+        dialog.setHeader("Delete User");
+        dialog.setText("Are you sure you want to delete user '" + user.getUsername() + "'?");
+        dialog.setConfirmText("Delete");
+        dialog.setConfirmButtonTheme("error primary");
+        dialog.addConfirmListener(e -> {
+            try {
+                userService.delete(user.getId());
+                refreshGrid();
+                Notification.show("User deleted", 2000, Notification.Position.BOTTOM_END);
+            } catch (Exception ex) {
+                Notification.show("Error: " + ex.getMessage(), 3000, Notification.Position.MIDDLE);
+            }
+        });
+        dialog.open();
+    }
+
+    private void refreshGrid() {
+        List<UserAccount> users = userService.findAll();
+        grid.setItems(users);
     }
 }
 ============================================================
