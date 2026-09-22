@@ -1,20 +1,32 @@
 package com.opcproxy;
 
 import com.vaadin.flow.theme.aura.Aura;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 import com.vaadin.flow.component.dependency.StyleSheet;
 import com.vaadin.flow.component.page.AppShellConfigurator;
 import com.vaadin.flow.component.page.Push;
+import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
+import java.security.Security;
+
+@EnableAsync
 @EnableScheduling
 @SpringBootApplication
 @StyleSheet(Aura.STYLESHEET)
 @StyleSheet("styles.css") // Your custom styles
 @Push
 public class Application implements AppShellConfigurator {
+
+    static {
+        // Убираем старую версию провайдера, если она где-то загрузилась
+        Security.removeProvider("BC");
+        // Регистрируем современный BC
+        Security.addProvider(new BouncyCastleProvider());
+    }
 
     public static void main(String[] args) {
         SpringApplication.run(Application.class, args);
@@ -548,6 +560,23 @@ public class SpelCalcEngine {
 
 package com.opcproxy.config;
 
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * Конфигурация Hibernate.
+ * ВАЖНО: AuditInterceptor регистрируется автоматически Spring Boot,
+ * так как он помечен как @Component и реализует org.hibernate.Interceptor.
+ * Ручная регистрация LocalContainerEntityManagerFactoryBean удалена
+ * во избежание циклических зависимостей и конфликтов с автоконфигурацией.
+ */
+@Configuration
+public class HibernateConfig {
+    // Пустой класс-маркер, если потребуется добавить специфичные свойства Hibernate в будущем.
+}
+============================================================
+
+package com.opcproxy.config;
+
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Configuration;
@@ -698,6 +727,8 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.List;
+
 @Data
 @Configuration
 @ConfigurationProperties(prefix = "app.opcua")
@@ -714,7 +745,15 @@ public class OpcUaConfig {
 
     private int minPublishingIntervalMs = 100;
 
+    /** true = «Доверять всем» — принимать любые клиентские сертификаты (небезопасно, для стенда). */
+    private boolean trustAllClients = true;
     private int defaultSamplingIntervalMs = 1000;
+    /** Включённые политики безопасности (аналог чек-боксов arOPC). */
+    /** Политики безопасности защищённых endpoint'ов (аналог чек-боксов arOPC). */
+    private java.util.List<String> enabledPolicies =
+            java.util.List.of("None", "Basic256Sha256");
+    private String trustStoreDir = "pki/trusted";
+    private String rejectedStoreDir = "pki/rejected";
 }
 ============================================================
 
@@ -773,6 +812,89 @@ public class SecurityConfig {
         // БЭКЛОГ (прод): BCrypt + вынос пользователей в БД (ТЗ §7.3).
         return NoOpPasswordEncoder.getInstance();
     }
+}
+============================================================
+
+package com.opcproxy.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.security.KeyPair;
+import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
+import java.util.Collections;
+
+/**
+ * Управление сертификатом UA-сервера (ТЗ §5.5.2).
+ * Генерация — штатным keytool JDK (без BouncyCastle: ТЗ запрещает вторую версию BC).
+ * Хранение: {pki-dir}/server.pfx (PKCS12).
+ * SAN включает URI:ApplicationUri — обязательное требование OPC UA.
+ */
+@Slf4j
+@Component
+public class UaCertificateManager {
+
+    @Value("${app.opcua.pki-dir:pki}")
+    private String pkiDir;
+    @Value("${app.opcua.application-uri:urn:opcproxy:ua:application}")
+    private String applicationUri;
+    @Value("${app.opcua.hostname:localhost}")
+    private String hostname;
+    @Value("${app.opcua.keystore-password:changeit}")
+    private String password;
+
+    private KeyPair keyPair;
+    private X509Certificate certificate;
+
+    public synchronized void ensureCertificate() throws Exception {
+        File ks = new File(pkiDir, "server.pfx");
+        Files.createDirectories(ks.getParentFile().toPath());
+
+        if (!ks.exists()) {
+            log.info("Generating self-signed UA server certificate via keytool...");
+            String dname = "CN=OPC DA-UA Proxy, O=OPCProxy";
+            String san = "dns:" + hostname + ",dns:localhost,ip:127.0.0.1,uri:" + applicationUri;
+
+            Process p = new ProcessBuilder(
+                    System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool",
+                    "-genkeypair",
+                    "-alias", "server",
+                    "-keyalg", "RSA", "-keysize", "2048",
+                    "-validity", "3650",
+                    "-dname", dname,
+                    "-ext", "SAN=" + san,
+                    "-ext", "bc=ca:false",
+                    "-ext", "ku=digitalSignature,keyEncipherment",
+                    "-ext", "eku=serverAuth,clientAuth",
+                    "-storetype", "PKCS12",
+                    "-keystore", ks.getAbsolutePath(),
+                    "-storepass", password,
+                    "-keypass", password
+            ).inheritIO().start();
+            if (p.waitFor() != 0) {
+                throw new IllegalStateException("keytool failed, exit=" + p.exitValue());
+            }
+            log.info("UA certificate created: {}", ks.getAbsolutePath());
+        }
+
+        var store = java.security.KeyStore.getInstance("PKCS12");
+        try (var in = Files.newInputStream(ks.toPath())) {
+            store.load(in, password.toCharArray());
+        }
+        PrivateKey key = (PrivateKey) store.getKey("server", password.toCharArray());
+        X509Certificate cert = (X509Certificate) store.getCertificate("server");
+        this.keyPair = new KeyPair(cert.getPublicKey(), key);
+        this.certificate = cert;
+        log.info("UA certificate loaded: subject={}, SAN applicationUri={}",
+                cert.getSubjectX500Principal().getName(), applicationUri);
+    }
+
+    public KeyPair getKeyPair() { return keyPair; }
+    public X509Certificate getCertificate() { return certificate; }
 }
 ============================================================
 
@@ -847,7 +969,20 @@ public class CsvTagService {
             printer.printComment("Generated: " + java.time.LocalDateTime.now()
                     + "; tags: " + tags.size() + "; delimiter: ';'; encoding: UTF-8");
             for (Tag t : tags) {
-                printer.printRecord(/* ...как было... */);
+                printer.printRecord(
+                t.getName(),
+                        t.getSourceType() != null ? t.getSourceType().name() : "",
+                        t.getConnection() != null ? t.getConnection().getName() : "",
+                        nvl(t.getSourceItemId()),
+                        nvl(t.getExpression()),
+                        t.getDataType() != null ? t.getDataType().name() : "",
+                        t.getReadMode() != null ? t.getReadMode().name() : "ASYNC",
+                        nvl(t.getRefreshPeriodMs()),
+                        nvl(t.getUaSamplingIntervalMs()),
+                        "",                                    // intervalProfileName (не резолвим тут)
+                        t.getPublishMqtt() != null ? t.getPublishMqtt() : false,
+                        nvl(t.getMqttDeadband()),
+                        nvl(t.getDescription()));
             }
         }
         return out.toByteArray();
@@ -1070,11 +1205,7 @@ import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.tags.TagValueUpdatedEvent;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
-import org.eclipse.paho.client.mqttv3.MqttCallback;
-import org.eclipse.paho.client.mqttv3.MqttClient;
-import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
-import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.*;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -1106,7 +1237,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 @Service
-public class MqttPublisherService implements MqttCallback {
+public class MqttPublisherService implements MqttCallbackExtended {
 
     private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ISO_INSTANT;
     private record BufferedMessage(String topic, byte[] payload, int qos, boolean retained) {}
@@ -1119,7 +1250,7 @@ public class MqttPublisherService implements MqttCallback {
     private MqttClient client;
 
     /** Снапшот настроек публикации: tagId -> TagConf. Обновляется по расписанию. */
-    private record TagConf(String name, boolean publish, Double deadband) {}
+    private record TagConf(String name, boolean publish, Double deadband, boolean enabled) {}
     private final Map<Long, TagConf> tagConfigs = new ConcurrentHashMap<>();
 
     /** Последнее опубликованное числовое значение (для deadband): tagId -> value. */
@@ -1186,7 +1317,7 @@ public class MqttPublisherService implements MqttCallback {
     private void heartbeat() {
         if (!props.isEnabled() || client == null || !client.isConnected()) return;
         tagConfigs.forEach((tagId, conf) -> {
-            if (!conf.publish()) return;
+            if (!conf.publish() || !conf.enabled()) return;
             try {
                 var tv = tagRegistry.getTagValue(tagId).orElse(null);
                 if (tv == null) return;
@@ -1211,7 +1342,8 @@ public class MqttPublisherService implements MqttCallback {
                 tagConfigs.put(t.getId(), new TagConf(
                         t.getName(),
                         Boolean.TRUE.equals(t.getPublishMqtt()),
-                        t.getMqttDeadband() != null ? t.getMqttDeadband().doubleValue() : null));
+                        t.getMqttDeadband() != null ? t.getMqttDeadband().doubleValue() : null,
+                        Boolean.TRUE.equals(t.getEnabled())));
             }
         } catch (Exception e) {
             log.debug("MQTT tag-config refresh failed: {}", e.getMessage());
@@ -1224,15 +1356,14 @@ public class MqttPublisherService implements MqttCallback {
 
     @EventListener
     public void onTagValueUpdated(TagValueUpdatedEvent event) {
+
         if (!props.isEnabled() || client == null || !client.isConnected()) {
             return;
         }
         try {
             Long tagId = event.getTagId();
             TagConf conf = tagConfigs.get(tagId);
-            if (conf == null || !conf.publish()) {
-                return;
-            }
+            if (conf == null || !conf.publish() || !conf.enabled()) return;
 
             Object value = event.getValue();
             String quality = event.getQuality() != null ? event.getQuality() : "Bad";
@@ -1274,6 +1405,7 @@ public class MqttPublisherService implements MqttCallback {
         mm.setRetained(m.retained());
         return mm;
     }
+    @Override
     public void connectComplete(boolean reconnect, String serverURI) {
         log.info("MQTT connected (reconnect={}) to {}", reconnect, serverURI);
         if (!reconnect) return;            // при первом старте буфер пуст
@@ -1343,8 +1475,9 @@ import java.util.stream.Collectors;
  * Петля жизненного цикла одного подключения на виртуальном потоке.
  *
  * Обязанности:
- *  - поддерживать подписку SyncAccess, пересоздавая её при изменении
- *    набора тегов / периода (изменения через UI подхватываются без рестарта);
+ *  - поддерживать подписку (Async20, при неудаче — SyncAccess), пересоздавая
+ *    её при изменении набора тегов / периода (изменения через UI
+ *    подхватываются без рестарта);
  *  - health-check канала (checkAlive) каждый цикл;
  *  - при смерти канала выйти — менеджер поднимет reconnect + новый поллер.
  *
@@ -1353,19 +1486,21 @@ import java.util.stream.Collectors;
 @Slf4j
 public class ConnectionPoller implements Runnable {
 
-    /** Сколько циклов (по 1 с) держим подписку до проверки изменений. */
+    /** Сколько циклов (по 1 с) между проверками, что подписка вообще существует. */
     private static final int RESUBSCRIBE_CHECK_DIVIDER = 5;
     private static final long CYCLE_MS = 1000;
 
     private final OpcDaClient client;
     private final TagRepository tagRepository;
     private final TagRegistry tagRegistry;
-    private boolean lastNoTags = true;
 
     private volatile boolean running = true;
-    private int subscribedHash = 0;   // hash набора (itemId + period) активной подписки
+    /** hash набора (itemId + period) активной подписки. 0 = ещё не подписаны. */
+    private int subscribedHash = 0;
 
-    public ConnectionPoller(OpcDaClient client, TagRepository tagRepository, TagRegistry tagRegistry) {
+    public ConnectionPoller(OpcDaClient client,
+                            TagRepository tagRepository,
+                            TagRegistry tagRegistry) {
         this.client = client;
         this.tagRepository = tagRepository;
         this.tagRegistry = tagRegistry;
@@ -1384,27 +1519,29 @@ public class ConnectionPoller implements Runnable {
         while (running) {
             try {
                 if (!client.isConnected()) {
-                    log.info("'{}': connection lost, poller exits (manager will reconnect)", name);
                     break;
                 }
 
                 List<Tag> tags = tagsOfThisConnection();
-
-                // Пересоздание подписки при изменении набора тегов/периода
                 int desiredHash = desiredHash(tags);
                 boolean needResubscribe = desiredHash != subscribedHash;
-                if (needResubscribe || (cycle % RESUBSCRIBE_CHECK_DIVIDER == 0 && !client.isSubscribed())) {
+
+                // Периодически проверяем, что подписка реально жива.
+                // isSubscribed() == false после silent-failure Async20
+                // (см. OpcDaClient.subscribeAsyncAll) или после markConnectionLost().
+                boolean subscriptionMissing = (cycle % RESUBSCRIBE_CHECK_DIVIDER == 0)
+                        && !tags.isEmpty()
+                        && !client.isSubscribed();
+
+                if (needResubscribe || subscriptionMissing) {
                     long period = periodOf(tags);
-                    int n = client.subscribeAll(tags, period, this::onValue);
-                    subscribedHash = needResubscribe ? desiredHash : subscribedHash;
-                    boolean noTags = tags.isEmpty();
-                    if (noTags != lastNoTags) {           // поле private boolean lastNoTags = true;
-                        log.info("'{}': {}", name, noTags ? "no tags configured yet" : "tags found, subscribing");
-                        lastNoTags = noTags;
+                    boolean ok = establishSubscription(tags, period, name);
+                    if (ok) {
+                        subscribedHash = desiredHash;
                     }
+                    // иначе subscribedHash не трогаем — повторим на следующем цикле
                 }
 
-                // Health-check: смерть канала -> выход, менеджер поднимет заново
                 if (!client.checkAlive()) {
                     log.warn("'{}': health check failed, poller exits", name);
                     break;
@@ -1427,16 +1564,79 @@ public class ConnectionPoller implements Runnable {
         log.info("Poller (virtual) stopped for '{}'", name);
     }
 
+    // ------------------------------------------------------------------
+    // Подписка: Async20 -> SyncAccess fallback
+    // ------------------------------------------------------------------
+
+    /**
+     * Устанавливает подписку. Порядок:
+     *   1. Если тегов нет — просто сбрасываем текущую подписку.
+     *   2. Если клиент ещё считает Async20 поддерживаемым — пробуем Async20.
+     *      При ЛЮБОЙ ошибке (в т.ч. silent failure внутри bind()) помечаем
+     *      Async20 недоступным и переходим к п.3.
+     *   3. Пробуем SyncAccess. Если и он падает — пробрасываем исключение,
+     *      внешний catch вызовет handleConnectionFailure.
+     *
+     * @return true, если подписка успешно установлена (или тегов нет).
+     */
+    private boolean establishSubscription(List<Tag> tags, long period, String name)
+            throws Exception {
+
+        // --- Нет тегов: останавливаем любую текущую подписку ---
+        if (tags.isEmpty()) {
+            try {
+                client.stopSubscription();
+            } catch (Exception e) {
+                log.debug("'{}': stopSubscription for empty tag set failed: {}",
+                        name, e.getMessage());
+            }
+            log.debug("'{}': no tags to subscribe", name);
+            return true;
+        }
+
+        // --- Пытаемся Async20 (если ещё не помечен как нерабочий) ---
+        if (client.isAsyncSupported()) {
+            try {
+                log.debug("'{}': attempting Async20 subscription for {} tags", name, tags.size());
+                client.subscribeAsyncAll(tags, period, this::onValue);
+                log.info("'{}': Async20 subscription established ({} tags)", name, tags.size());
+                return true;
+            } catch (Exception e) {
+                log.warn("'{}': Async20 subscription failed ({}), switching to SyncAccess: {}",
+                        name, e.getClass().getSimpleName(), e.getMessage());
+                client.setAsyncSupported(false);
+                // НЕ пробрасываем — идём в SyncAccess
+            }
+        }
+
+        // --- Fallback: SyncAccess ---
+        try {
+            int n = client.subscribeAll(tags, period, this::onValue);
+            log.info("'{}': SyncAccess subscription established ({} of {} tags)",
+                    name, n, tags.size());
+            return true;
+        } catch (Exception e) {
+            log.warn("'{}': SyncAccess subscription failed: {}", name, e.getMessage());
+            throw e;   // внешний catch -> handleConnectionFailure
+        }
+    }
+
     private void onValue(Long tagId, Object value, String quality, Instant ts) {
         tagRegistry.updateTagValue(tagId, value, quality, ts);
     }
+
+    // ------------------------------------------------------------------
+    // Хелперы
+    // ------------------------------------------------------------------
 
     private List<Tag> tagsOfThisConnection() {
         Long connId = client.getConnectionId();
         return tagRepository.findBySourceType(SourceType.DA).stream()
                 .filter(t -> Boolean.TRUE.equals(t.getEnabled()))
-                .filter(t -> t.getConnection() != null && connId.equals(t.getConnection().getId()))
-                .filter(t -> t.getSourceItemId() != null && !t.getSourceItemId().isBlank())
+                .filter(t -> t.getConnection() != null
+                        && connId.equals(t.getConnection().getId()))
+                .filter(t -> t.getSourceItemId() != null
+                        && !t.getSourceItemId().isBlank())
                 .collect(Collectors.toList());
     }
 
@@ -1448,7 +1648,8 @@ public class ConnectionPoller implements Runnable {
                 .filter(Objects::nonNull)
                 .min(Integer::compare)     // самый быстрый тег задаёт период группы
                 .map(Integer::longValue)
-                .orElse(Long.valueOf(client.getConnectionConfig().getDefaultRefreshPeriodMs()));
+                .orElse(Long.valueOf(
+                        client.getConnectionConfig().getDefaultRefreshPeriodMs()));
     }
 
     private int desiredHash(List<Tag> tags) {
@@ -1474,30 +1675,28 @@ package com.opcproxy.opcda;
 
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
+import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.security.PasswordCipher;
 import com.opcproxy.tags.TagRegistry;
 import lombok.Getter;
+import org.jinterop.dcom.common.JIException;
 import org.openscada.opc.lib.common.ConnectionInformation;
-import org.openscada.opc.lib.da.AccessBase;
-import org.openscada.opc.lib.da.Group;
-import org.openscada.opc.lib.da.Item;
-import org.openscada.opc.lib.da.ItemState;
-import org.openscada.opc.lib.da.Server;
-import org.openscada.opc.lib.da.SyncAccess;
+import org.openscada.opc.lib.common.NotConnectedException;
+import org.openscada.opc.lib.da.*;
+import org.openscada.opc.lib.da.browser.FlatBrowser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.UnknownHostException;
 import java.time.Instant;
-import java.util.Calendar;
-import java.util.Collection;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Клиент одного OPC DA-подключения.
@@ -1505,48 +1704,51 @@ import java.util.regex.Pattern;
  * Два режима работы:
  * 1) Подписка (основной, ТЗ §5.2.3): subscribeAll() создает SyncAccess —
  * Utgard сам опрашивает группу с периодом подключения и дергает callback.
- * Один group-read за цикл вместо N поштучных DCOM-вызовов.
  * 2) Поштучный sync-режим (резерв, ТЗ §5.2.4): addItem() + readAllSync().
  * <p>
  * Scheduler создается на виртуальных потоках (нужен Utgard'у для AccessBase
- * и async-механизмов). Патчи Server/JIComServer (session security) применяются
+ * и async- to механизмов). Патчи Server/JIComServer (session security) применяются
  * внутри патченных классов из src/main/java.
  */
 @Getter
 public class OpcDaClient {
-    /**
-     * ItemID, которые не удалось подписать (ТЗ §5.2.8); перепроверяются по расписанию.
-     */
-    private final java.util.Set<String> notFoundItemIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final Logger log = LoggerFactory.getLogger(OpcDaClient.class);
+    private volatile Async20Access asyncAccess;
+    private final AtomicBoolean asyncSupported = new AtomicBoolean(true);
+
+    private static final Set<Class<?>> UA_SAFE = Set.of(
+            Boolean.class, Byte.class, Short.class, Integer.class, Long.class,
+            Float.class, Double.class, String.class,
+            org.eclipse.milo.opcua.stack.core.types.builtin.DateTime.class);
 
     private static final Pattern CLSID_PATTERN = Pattern.compile(
             "^\\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}?$");
 
     /**
-     * Приёмник значения тега из подписки (реализует TagRegistry-обновление).
+     * ItemID, которые не удалось подписать (ТЗ §5.2.8); перепроверяются по расписанию.
      */
-    @FunctionalInterface
-    public interface TagValueSink {
-        void accept(Long tagId, Object value, String quality, Instant timestamp);
-    }
+    private final Set<String> notFoundItemIds = ConcurrentHashMap.newKeySet();
 
     private final OpcDaConnection connectionConfig;
     private final Long connectionId;
-    private final PasswordCipher passwordCipher;   // <-- новое поле
+    private final PasswordCipher passwordCipher;
     private final TagRegistry tagRegistry;
+
     private Server server;
     private Group group;
     private ScheduledExecutorService scheduler;
     private volatile AccessBase access;
-
     private final Map<String, Item> items = new ConcurrentHashMap<>();
     private final AtomicBoolean connected = new AtomicBoolean(false);
     private final AtomicInteger errorCount = new AtomicInteger(0);
     private volatile long lastDataTimestamp = System.currentTimeMillis();
 
-    public OpcDaClient(OpcDaConnection connectionConfig,
-                       PasswordCipher passwordCipher, TagRegistry tagRegistry) {
+    @FunctionalInterface
+    public interface TagValueSink {
+        void accept(Long tagId, Object value, String quality, Instant timestamp);
+    }
+
+    public OpcDaClient(OpcDaConnection connectionConfig, PasswordCipher passwordCipher, TagRegistry tagRegistry) {
         this.connectionConfig = connectionConfig;
         this.connectionId = connectionConfig.getId();
         this.passwordCipher = passwordCipher;
@@ -1556,7 +1758,6 @@ public class OpcDaClient {
     // ------------------------------------------------------------------
     // Подключение
     // ------------------------------------------------------------------
-
     public synchronized void connect() throws Exception {
         if (connected.get()) {
             log.warn("Connection {} already connected", connectionConfig.getName());
@@ -1564,8 +1765,7 @@ public class OpcDaClient {
         }
         log.info("Connecting to OPC DA server: {}@{}", connectionConfig.getName(), connectionConfig.getHost());
 
-        String rawId = connectionConfig.getProgIdOrClsid() != null
-                ? connectionConfig.getProgIdOrClsid().trim() : "";
+        String rawId = connectionConfig.getProgIdOrClsid() != null ? connectionConfig.getProgIdOrClsid().trim() : "";
         boolean clsidMode = rawId.matches(CLSID_PATTERN.pattern());
 
         try {
@@ -1573,8 +1773,7 @@ public class OpcDaClient {
             connInfo.setHost(connectionConfig.getHost());
             connInfo.setUser(connectionConfig.getUsername());
             connInfo.setPassword(passwordCipher.decrypt(connectionConfig.getPasswordEncrypted()));
-            connInfo.setDomain(connectionConfig.getDomain() != null
-                    ? connectionConfig.getDomain().trim() : "");
+            connInfo.setDomain(connectionConfig.getDomain() != null ? connectionConfig.getDomain().trim() : "");
 
             if (clsidMode) {
                 String clsid = rawId;
@@ -1587,7 +1786,6 @@ public class OpcDaClient {
                 log.info("Using ProgID: {} (требует доступа к реестру по SMB)", rawId);
             }
 
-            // Scheduler на виртуальных потоках — обязателен для AccessBase (SyncAccess/Async20Access)
             this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = Thread.ofVirtual()
                         .name("utgard-sched-" + connectionConfig.getName())
@@ -1598,7 +1796,6 @@ public class OpcDaClient {
             server = new Server(connInfo, this.scheduler);
             server.connect();
             group = server.addGroup();
-
             connected.set(true);
             errorCount.set(0);
             log.info("Successfully connected to OPC DA server: {}", connectionConfig.getName());
@@ -1609,14 +1806,63 @@ public class OpcDaClient {
             throw e;
         }
     }
-
-    public boolean hasNotFoundItems() {
-        return !notFoundItemIds.isEmpty();
+    public boolean isAsyncSupported() {
+        return asyncSupported.get();
     }
 
-    public int getNotFoundCount() {
-        return notFoundItemIds.size();
+    public void setAsyncSupported(boolean supported) {
+        asyncSupported.set(supported);
     }
+
+    public synchronized int subscribeAsyncAll(Collection<Tag> tags, long periodMs, TagValueSink sink) throws Exception {
+        stopSubscription();
+        if (!connected.get() || server == null) {
+            throw new IllegalStateException("Not connected: " + connectionConfig.getName());
+        }
+        log.info("Subscribing (Async) {} tags of '{}' with period {} ms",
+                tags.size(), connectionConfig.getName(), periodMs);
+
+        FailFastAsync20Access access = new FailFastAsync20Access(server, (int) periodMs, true);
+        int subscribed = 0;
+        for (Tag tag : tags) {
+            try {
+                final Long tagId = tag.getId();
+                access.addItem(tag.getSourceItemId(),
+                        (item, state) -> deliverValue(tagId, state, sink));
+                subscribed++;
+            } catch (Exception e) {
+                log.warn("Async subscribe failed for item '{}': {}",
+                        tag.getSourceItemId(), e.getMessage());
+                throw e;   // триггерит fallback в ConnectionPoller
+            }
+        }
+
+        this.asyncAccess = access;
+        this.access = access;
+
+        try {
+            access.bind();
+        } catch (Exception e) {
+            this.access = null;
+            this.asyncAccess = null;
+            throw e;
+        }
+
+        // КЛЮЧЕВОЕ: Utgard глотает ошибку start() внутри connectionStateChanged(),
+        // поэтому проверяем сохранённую ошибку вручную.
+        Exception startError = access.getStartError();
+        if (startError != null) {
+            log.warn("'{}': Async20 start() failed silently: {} — falling back to SyncAccess",
+                    connectionConfig.getName(), startError.getMessage());
+            try { access.unbind(); } catch (Exception ignore) { /* уже развалилось */ }
+            this.access = null;
+            this.asyncAccess = null;
+            throw startError;
+        }
+
+        return subscribed;
+    }
+
 
     public synchronized void disconnect() {
         if (!connected.get() && server == null) return;
@@ -1635,9 +1881,7 @@ public class OpcDaClient {
             notFoundItemIds.clear();
             log.info("Disconnected from OPC DA server: {}", connectionConfig.getName());
         } catch (Exception e) {
-            // 0x00001051 при shutdown — гонка с jI_ShutdownHook, штатная ситуация
-            log.info("Disconnect from {} completed with cleanup note: {}",
-                    connectionConfig.getName(), e.getMessage());
+            log.info("Disconnect from {} completed with cleanup note: {}", connectionConfig.getName(), e.getMessage());
         } finally {
             cleanupScheduler();
             connected.set(false);
@@ -1645,215 +1889,320 @@ public class OpcDaClient {
     }
 
     // ------------------------------------------------------------------
-    // Подписка (основной режим)
+    // Браузинг (ТЗ §5.2.6)
     // ------------------------------------------------------------------
-
     /**
-     * Создает/пересоздает подписку SyncAccess на набор тегов подключения.
-     * Utgard сам опрашивает группу с периодом и вызывает sink на каждое чтение.
+     * Получение иерархического списка тегов с OPC DA-сервера.
+     * ТЗ §5.2.6: Если сервер не поддерживает иерархический просмотр,
+     * система должна автоматически переходить к плоскому списку.
      *
-     * @param tags   теги ЭТОГО подключения (enabled, с непустым sourceItemId)
-     * @param period период опроса группы, мс
-     * @param sink   приемник значений
-     * @return число реально подписанных тегов
+     * РЕАЛИзация: Мы используем FlatBrowser (поддерживается 100% серверов),
+     * получаем плоский список ItemID и строим из него дерево на стороне Java,
+     * разбивая строки по разделителям '/' или '\'. Это обходит проблему
+     * protected-методов в TreeBrowser библиотеки Utgard 1.5.0.
+     *
+     * @return иерархический список элементов с name, itemId и признаком isBranch.
+     * @throws Exception если не подключено или браузер не поддерживается.
      */
-    public synchronized int subscribeAll(Collection<Tag> tags, long periodMs, TagValueSink sink)
-            throws Exception {
-        stopSubscription();
+    public List<RestDtos.BrowseNodeDto> browseTree() throws Exception {
         if (!connected.get() || server == null) {
             throw new IllegalStateException("Not connected: " + connectionConfig.getName());
         }
-        if (tags.isEmpty()) {
+
+        FlatBrowser flatBrowser = server.getFlatBrowser();
+        if (flatBrowser == null) {
+            throw new UnsupportedOperationException("Flat browsing not supported by this server");
+        }
+
+        Collection<String> flatItems = flatBrowser.browse();
+
+        Map<String, RestDtos.BrowseNodeDto> nodeMap = new LinkedHashMap<>();
+        List<RestDtos.BrowseNodeDto> rootNodes = new ArrayList<>();
+
+        for (String itemId : flatItems) {
+            if (itemId == null || itemId.isBlank()) continue;
+
+            // Разделяем ItemID на части (поддерживаем '/' и '\')
+            String[] parts = itemId.split("[\\\\/]");
+            String currentPath = "";
+            RestDtos.BrowseNodeDto parent = null;
+
+            for (int i = 0; i < parts.length; i++) {
+                String part = parts[i];
+                currentPath = currentPath.isEmpty() ? part : currentPath + "/" + part;
+                boolean isLeaf = (i == parts.length - 1);
+
+                if (!nodeMap.containsKey(currentPath)) {
+                    RestDtos.BrowseNodeDto node = new RestDtos.BrowseNodeDto(
+                            part,
+                            isLeaf ? itemId : null, // itemId есть только у листа (конкретного тега)
+                            !isLeaf,                // isBranch = true для всех, кроме последнего элемента
+                            new ArrayList<>()
+                    );
+                    nodeMap.put(currentPath, node);
+
+                    if (parent == null) {
+                        rootNodes.add(node);
+                    } else {
+                        parent.children().add(node);
+                    }
+                }
+                parent = nodeMap.get(currentPath);
+            }
+        }
+
+        return rootNodes;
+    }
+
+    // ------------------------------------------------------------------
+    // Подписка (основной режим)
+    // ------------------------------------------------------------------
+    /**
+     * Создает/пересоздает подписку SyncAccess на набор тегов подключения.
+     * Utgard сам опрашивает группу с заданным периодом и вызывает sink на каждое чтение.
+     *
+     * ТЗ §5.2.3, §5.2.8: Если конкретный ItemID не найден, подписка на остальные
+     * продолжается, а проблемный ItemID заносится в notFoundItemIds для последующего речека.
+     *
+     * @param tags     теги ЭТОГО подключения (enabled, с непустым sourceItemId)
+     * @param periodMs период опроса группы, мс
+     * @param sink     приемник значений
+     * @return число реально подписанных тегов
+     * @throws Exception если клиент не подключен
+     */
+    public synchronized int subscribeAll(Collection<Tag> tags, long periodMs, TagValueSink sink) throws Exception {
+        // 1. Останавливаем предыдущую подписку, если она была
+        stopSubscription();
+
+        if (!connected.get() || server == null) {
+            throw new IllegalStateException("Not connected: " + connectionConfig.getName());
+        }
+
+        if (tags == null || tags.isEmpty()) {
             return 0;
         }
 
-        log.info("Subscribing {} tags of '{}' with period {} ms",
-                tags.size(), connectionConfig.getName(), periodMs);
+        log.info("Subscribing {} tags of '{}' with period {} ms", tags.size(), connectionConfig.getName(), periodMs);
 
+        // 2. Создаем объект синхронного доступа Utgard
         SyncAccess syncAccess = new SyncAccess(server, (int) periodMs);
         int subscribed = 0;
+
+        // 3. Пытаемся добавить каждый тег. Ошибка на одном теге не прерывает цикл.
         for (Tag tag : tags) {
             String itemId = tag.getSourceItemId();
             try {
                 final Long tagId = tag.getId();
-                syncAccess.addItem(itemId, (item, state) ->
-                        deliverValue(tagId, state, sink));
-                notFoundItemIds.remove(itemId);      // <-- ДОБАВИТЬ: подписался — снимаем метку
+                // Регистрируем callback для конкретного ItemID
+                syncAccess.addItem(itemId, (item, state) -> deliverValue(tagId, state, sink));
+
+                // Успех: убираем из списка проблемных, если он там был
+                notFoundItemIds.remove(itemId);
                 subscribed++;
             } catch (Exception e) {
-                log.debug("Subscribe failed for item '{}' (tag '{}'): {}",
-                        itemId, tag.getName(), e.getMessage());
-                notFoundItemIds.add(itemId);          // <-- ДОБАВИТЬ
+                // Неудача: логируем, добавляем в список проблемных, уведомляем sink
+                log.debug("Subscribe failed for item '{}' (tag '{}'): {}", itemId, tag.getName(), e.getMessage());
+                notFoundItemIds.add(itemId);
                 sink.accept(tag.getId(), null, "Bad_NotFound", Instant.now());
             }
         }
+
+        // 4. Активируем подписку (начинает работу фоновый планировщик Utgard)
         syncAccess.bind();
         this.access = syncAccess;
+
+        // 5. Итоговое логиров状态
         log.info("Subscribed {} tags of '{}'", subscribed, connectionConfig.getName());
-        if (!notFoundItemIds.isEmpty()) log.warn("{} item(s) still not found on '{}'",
-                notFoundItemIds.size(), connectionConfig.getName());
+        if (!notFoundItemIds.isEmpty()) {
+            log.warn("{} item(s) still not found on '{}'", notFoundItemIds.size(), connectionConfig.getName());
+        }
+
         return subscribed;
     }
 
-    /**
-     * Останавливает активную подписку (безопасно, если её нет).
-     */
-    public synchronized void stopSubscription() {
-        AccessBase a = this.access;
-        this.access = null;
-        if (a != null) {
-            try {
-                a.unbind();
-            } catch (Exception e) {
-                log.debug("Unbind failed for {}: {}", connectionConfig.getName(), e.getMessage());
+        public synchronized void stopSubscription() {
+            AccessBase a = this.access;
+            this.access = null;
+            if (a != null) {
+                try {
+                    a.unbind();
+                } catch (Exception e) {
+                    log.debug("Unbind failed for {}: {}", connectionConfig.getName(), e.getMessage());
+                }
             }
         }
-    }
 
-    public boolean isSubscribed() {
-        return access != null;
-    }
+        public boolean isSubscribed() {
+            return access != null;
+        }
 
-    private void deliverValue(Long tagId, ItemState state, TagValueSink sink) {
-        try {
-            Object value = OpcDaValues.unwrapVariant(state.getValue());
-            String quality = OpcDaValues.parseOpcQuality(state.getQuality());
-            if (!quality.startsWith("Good")) {
-                value = null;   // не-Good значение скрываем (ошибка №15)
+        private void deliverValue(Long tagId, ItemState state, TagValueSink sink) {
+            try {
+                Object value = OpcDaValues.unwrapVariant(state.getValue());
+                String quality = OpcDaValues.parseOpcQuality(state.getQuality());
+
+                if (!quality.startsWith("Good")) {
+                    value = null;
+                } else if (value != null && !UA_SAFE.contains(value.getClass())) {
+                    log.debug("Coercing unsupported value type {} for tag {}", value.getClass().getName(), tagId);
+                    value = String.valueOf(value);
+                }
+
+                Calendar ts = state.getTimestamp();
+                sink.accept(tagId, value, quality, ts != null ? ts.toInstant() : Instant.now());
+                lastDataTimestamp = System.currentTimeMillis();
+            } catch (Exception e) {
+                log.debug("Deliver value failed for tag {}: {}", tagId, e.getMessage());
+                sink.accept(tagId, null, "Bad_CommunicationFailure", Instant.now());
             }
-            Calendar ts = state.getTimestamp();
-            sink.accept(tagId, value, quality, ts != null ? ts.toInstant() : Instant.now());
+        }
+
+        // ------------------------------------------------------------------
+        // Поштучный sync-режим (резерв / тестирование)
+        // ------------------------------------------------------------------
+        public Item addItem(String itemId) throws Exception {
+            if (!connected.get() || group == null) {
+                throw new IllegalStateException("Not connected to OPC DA server");
+            }
+            Item existing = items.get(itemId);
+            if (existing != null) return existing;
+            try {
+                Item item = group.addItem(itemId);
+                items.put(itemId, item);
+                return item;
+            } catch (Exception e) {
+                handleConnectionFailure(e);
+                notFoundItemIds.add(itemId);
+                log.debug("addItem failed for '{}': {}", itemId, e.getMessage());
+                throw e;
+            }
+        }
+
+        public void removeItem(String itemId) {
+            Item item = items.remove(itemId);
+            if (item != null && group != null) {
+                try {
+                    group.removeItem(itemId);
+                } catch (Exception e) {
+                    log.debug("removeItem {} failed: {}", itemId, e.getMessage());
+                }
+            }
+        }
+
+        public ItemState readSync(String itemId) throws Exception {
+            Item item = addItem(itemId);
+            ItemState state = item.read(false);
             lastDataTimestamp = System.currentTimeMillis();
-        } catch (Exception e) {
-            log.debug("Deliver value failed for tag {}: {}", tagId, e.getMessage());
-            sink.accept(tagId, null, "Bad_CommunicationFailure", Instant.now());
+            return state;
         }
-    }
 
-    // ------------------------------------------------------------------
-    // Поштучный sync-режим (резерв / тестирование)
-    // ------------------------------------------------------------------
-
-    public Item addItem(String itemId) throws Exception {
-        if (!connected.get() || group == null) {
-            throw new IllegalStateException("Not connected to OPC DA server");
-        }
-        Item existing = items.get(itemId);
-        if (existing != null) return existing;
-        try {
-            Item item = group.addItem(itemId);
-            items.put(itemId, item);
-            return item;
-        } catch (Exception e) {
-            handleConnectionFailure(e);
-            notFoundItemIds.add(itemId);
-            log.debug("addItem failed for '{}': {}", itemId, e.getMessage());
-            throw e;
-        }
-    }
-
-    public void removeItem(String itemId) {
-        Item item = items.remove(itemId);
-        if (item != null && group != null) {
-            try {
-                group.removeItem(itemId);
-            } catch (Exception e) {
-                log.debug("removeItem {} failed: {}", itemId, e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * Разовое чтение одного item (sync-fallback).
-     */
-    public ItemState readSync(String itemId) throws Exception {
-        Item item = addItem(itemId);
-        ItemState state = item.read(false);
-        lastDataTimestamp = System.currentTimeMillis();
-        return state;
-    }
-
-    // ------------------------------------------------------------------
-    // Health / отказоустойчивость
-    // ------------------------------------------------------------------
-
-    /**
-     * Активная проверка живости канала; при обрыве Utgard сам делает dispose().
-     */
-    public boolean checkAlive() {
-        if (server == null) {
-            connected.set(false);
-            return false;
-        }
-        try {
-            if (server.getServerState() == null) {
-                log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
+        // ------------------------------------------------------------------
+        // Health / отказоустойчивость
+        // ------------------------------------------------------------------
+        public boolean checkAlive() {
+            if (server == null) {
                 connected.set(false);
                 return false;
             }
-            return true;
-        } catch (Throwable t) {
-            log.warn("Health check threw for {}: {}", connectionConfig.getName(), t.getMessage());
-            connected.set(false);
-            return false;
-        }
-    }
-
-    /**
-     * Реакция на ошибку уровня соединения: помечаем канал мёртвым.
-     */
-    public synchronized void handleConnectionFailure(Throwable e) {
-        String msg = String.valueOf(e.getMessage());
-        boolean fatal = msg.contains("0x8001FFFF")
-                || msg.contains("0x80010108")
-                || msg.contains("0x800706BA")
-                || msg.contains("0x800703FA")     // сервер не может перезапуститься (service)
-                || msg.contains("0x800700A4")     // threads exhausted на сервере
-                || msg.contains("Connection reset")
-                || msg.contains("ping failed");
-        if (fatal && connected.get()) {
-            log.warn("Connection-level failure for {}: {} — marking lost",
-                    connectionConfig.getName(), msg);
-            markConnectionLost();
-        }
-    }
-
-    public synchronized void markConnectionLost() {
-        connected.set(false);
-        errorCount.incrementAndGet();
-        stopSubscription();
-        try {
-            if (server != null) {
-                server.dispose();
+            try {
+                if (server.getServerState() == null) {
+                    log.warn("Health check failed for {}, session disposed", connectionConfig.getName());
+                    connected.set(false);
+                    return false;
+                }
+                return true;
+            } catch (Throwable t) {
+                log.warn("Health check threw for {}: {}", connectionConfig.getName(), t.getMessage());
+                connected.set(false);
+                return false;
             }
-        } catch (Exception ex) {
-            log.debug("Dispose after failure: {}", ex.getMessage());
+        }
+
+        public synchronized void handleConnectionFailure(Throwable e) {
+            String msg = String.valueOf(e.getMessage());
+            boolean fatal = msg.contains("0x8001FFFF")
+                    || msg.contains("0x80010108")
+                    || msg.contains("0x800706BA")
+                    || msg.contains("0x800703FA")
+                    || msg.contains("0x800700A4")
+                    || msg.contains("Connection reset")
+                    || msg.contains("ping failed");
+
+            if (fatal && connected.get()) {
+                log.warn("Connection-level failure for {}: {} — marking lost", connectionConfig.getName(), msg);
+                markConnectionLost();
+            }
+        }
+
+        public synchronized void markConnectionLost() {
+            connected.set(false);
+            errorCount.incrementAndGet();
+            stopSubscription();
+            try {
+                if (server != null) {
+                    server.dispose();
+                }
+            } catch (Exception ex) {
+                log.debug("Dispose after failure: {}", ex.getMessage());
+            }
+        }
+
+        public boolean isConnected() {
+            return connected.get();
+        }
+
+        public ConnectionState getState() {
+            return connected.get() ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED;
+        }
+
+        public int getErrorCount() {
+            return errorCount.get();
+        }
+
+        public boolean hasNotFoundItems() {
+            return !notFoundItemIds.isEmpty();
+        }
+
+        public int getNotFoundCount() {
+            return notFoundItemIds.size();
+        }
+
+        // ------------------------------------------------------------------
+        // Внутреннее
+        // ------------------------------------------------------------------
+        private void cleanupScheduler() {
+            if (scheduler != null) {
+                scheduler.shutdownNow();
+                scheduler = null;
+            }
+        }
+    /**
+     * Подкласс Async20Access, который не позволяет Utgard "проглотить"
+     * ошибку в start(): сохраняет её, чтобы subscribeAsyncAll мог
+     * детектировать silent-failure и переключиться на SyncAccess.
+     */
+    private static class FailFastAsync20Access extends Async20Access {
+        private volatile Exception startError;
+
+        FailFastAsync20Access(Server server, int period, boolean initialRefresh) throws DuplicateGroupException, UnknownHostException, NotConnectedException, JIException {
+            super(server, period, initialRefresh);
+        }
+
+        @Override
+        protected void start() throws DuplicateGroupException, UnknownHostException, NotConnectedException, JIException {
+            try {
+                super.start();
+            } catch (Exception e) {
+                this.startError = e;
+                throw e;   // пусть AccessBase тоже залогирует
+            }
+        }
+
+        Exception getStartError() {
+            return startError;
         }
     }
-
-    public boolean isConnected() {
-        return connected.get();
     }
-
-    public ConnectionState getState() {
-        return connected.get() ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED;
-    }
-
-    public int getErrorCount() {
-        return errorCount.get();
-    }
-
-    // ------------------------------------------------------------------
-    // Внутреннее
-    // ------------------------------------------------------------------
-
-    private void cleanupScheduler() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
-            scheduler = null;
-        }
-    }
-}
 ============================================================
 
 package com.opcproxy.opcda;
@@ -1861,6 +2210,7 @@ package com.opcproxy.opcda;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.repository.OpcDaConnectionRepository;
 import com.opcproxy.persistence.repository.TagRepository;
+import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.security.PasswordCipher;
 import com.opcproxy.tags.TagRegistry;
 import jakarta.annotation.PreDestroy;
@@ -1871,6 +2221,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1892,12 +2243,21 @@ public class OpcDaConnectionManager {
     private final Map<Long, OpcDaClient> clients = new ConcurrentHashMap<>();
     private final Map<Long, ConnectionPoller> pollers = new ConcurrentHashMap<>();
 
+
+    private static final long RETRY_BASE_MS = 5_000;
+    private static final long RETRY_MAX_MS  = 60_000;
+
+    // Кэш для браузинга (ТЗ §5.2.6: кэширование результатов на сессию или TTL)
+    private static final long BROWSE_CACHE_TTL_MS = 60_000; // 60 секунд
+    private final Map<Long, List<RestDtos.BrowseNodeDto>> browseCache = new ConcurrentHashMap<>();
+    private final Map<Long, Long> browseCacheTime = new ConcurrentHashMap<>();
+
+
+
     private final Map<Long, Long> nextAttemptAt = new ConcurrentHashMap<>();
     private final Map<Long, Integer> attemptCount = new ConcurrentHashMap<>();
     private final Map<Long, Object> locks = new ConcurrentHashMap<>();
 
-    private static final long RETRY_BASE_MS = 5_000;
-    private static final long RETRY_MAX_MS  = 60_000;
 
     // ------------------------------------------------------------------
     // Жизненный цикл
@@ -1972,7 +2332,6 @@ public class OpcDaConnectionManager {
             }
         }
     }
-
     public void disconnect(Long connectionId) {
         synchronized (lockFor(connectionId)) {
             stopPoller(connectionId);
@@ -1980,8 +2339,8 @@ public class OpcDaConnectionManager {
             if (client != null) {
                 client.disconnect();
                 clearBackoff(connectionId);
-                log.info("Disconnected and removed OPC DA server: {}",
-                        client.getConnectionConfig().getName());
+                invalidateBrowseCache(connectionId); // <-- ОЧИСТКА КЭША
+                log.info("Disconnected and removed OPC DA server: {}", client.getConnectionConfig().getName());
             }
         }
     }
@@ -2004,6 +2363,42 @@ public class OpcDaConnectionManager {
                         client.getConnectionConfig().getName(), e.getMessage());
             }
         }
+    }
+    /**
+     * Очистка кэша браузинга при переподключении или изменении конфигурации.
+     */
+    public void invalidateBrowseCache(Long connectionId) {
+        browseCache.remove(connectionId);
+        browseCacheTime.remove(connectionId);
+    }
+    /**
+     * Браузинг тегов для конкретного подключения с кэшированием (ТЗ §5.2.6, §5.9.3).
+     *
+     * @param connectionId ID подключения
+     * @return список доступных элементов OPC DA (иерархический или плоский)
+     * @throws Exception если подключение неактивно или ошибка DCOM
+     */
+    public List<RestDtos.BrowseNodeDto> browse(Long connectionId) throws Exception {
+        long now = System.currentTimeMillis();
+        Long lastUpdate = browseCacheTime.get(connectionId);
+
+        if (lastUpdate != null && (now - lastUpdate) < BROWSE_CACHE_TTL_MS) {
+            log.debug("Serving browse cache for connection {}", connectionId);
+            return browseCache.get(connectionId);
+        }
+
+        OpcDaClient client = clients.get(connectionId);
+        if (client == null || !client.isConnected()) {
+            throw new IllegalStateException("Connection not active or not found: " + connectionId);
+        }
+
+        log.info("Fetching fresh browse list for connection {}", connectionId);
+        List<RestDtos.BrowseNodeDto> result = client.browseTree();
+
+        browseCache.put(connectionId, result);
+        browseCacheTime.put(connectionId, now);
+
+        return result;
     }
 
     public Optional<OpcDaClient> getClient(Long connectionId) {
@@ -2118,12 +2513,12 @@ public class OpcDaConnectionManager {
 
 package com.opcproxy.opcda;
 
-import org.jinterop.dcom.core.JIUnsignedByte;
-import org.jinterop.dcom.core.JIUnsignedInteger;
-import org.jinterop.dcom.core.JIUnsignedShort;
-import org.jinterop.dcom.core.JIVariant;
+import org.jinterop.dcom.core.*;
 
 import java.lang.reflect.Method;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.Calendar;
 
 /** Конвертеры значений и качества OPC DA. Используются поллером и подписками. */
 public final class OpcDaValues {
@@ -2132,22 +2527,59 @@ public final class OpcDaValues {
 
     /** Распаковка JIVariant / JIUnsigned* в стандартные Java-типы (Da Client §4.3, ошибка №8). */
     public static Object unwrapVariant(Object raw) {
-        if (raw == null) return null;
-        if (raw instanceof JIVariant variant) {
-            try {
-                return unwrapVariant(variant.getObject());
-            } catch (Exception e) {
-                return raw;
+        switch (raw) {
+            case null -> {
+                return null;
+            }
+            case JIVariant variant -> {
+                try {
+                    return unwrapVariant(variant.getObject());
+                } catch (Exception e) {
+                    return raw;
+                }
+            }
+            case JIUnsignedByte b -> {
+                return b.getValue();
+            }
+            case JIUnsignedShort s -> {
+                return s.getValue();
+            }
+            case JIUnsignedInteger i -> {
+                return i.getValue();
+            }
+            default -> {
             }
         }
-        if (raw instanceof JIUnsignedByte b) return b.getValue();
-        if (raw instanceof JIUnsignedShort s) return s.getValue();
-        if (raw instanceof JIUnsignedInteger i) return i.getValue();
         if (raw.getClass().getName().startsWith("org.jinterop.dcom.core.JIUnsigned")) {
             try {
                 Method getValue = raw.getClass().getMethod("getValue");
                 return getValue.invoke(raw);
             } catch (Exception ignore) { }
+        }
+        // JIString j-Interop'а -> обычная Java-строка (иначе Milo не сможет закодировать Variant)
+        switch (raw) {
+            case JIString js -> {
+                try {
+                    return js.getString();
+                } catch (Exception e) {
+                    return js.toString();
+                }
+            }
+
+            // Character -> Short (DA иногда отдаёт 16-битные как char; 'Û' = 219)
+            case Character c -> {
+                return (short) c.charValue();
+            }
+
+            // java.util.Date / Calendar -> OffsetDateTime (builtin DateTime в Milo)
+            case java.util.Date d -> {
+                return new org.eclipse.milo.opcua.stack.core.types.builtin.DateTime(d);
+            }
+            case Calendar cal -> {
+                return new org.eclipse.milo.opcua.stack.core.types.builtin.DateTime(cal.getTime());
+            }
+            default -> {
+            }
         }
         return raw;
     }
@@ -2275,7 +2707,9 @@ public class AddressSpaceBuilder {
         for (Tag tag : tags) {
             createTagNode(tag, tagsFolder, sourcesFolder);
         }
-
+        log.info("Building OPC UA Address Space...");
+        log.info(">>> Custom namespace index = {} (URI: {})",
+                namespace.getNamespaceIndex(), opcUaConfig.getNamespaceUri());
         log.info("Address Space built successfully. Total enabled tags: {}", tags.size());
     }
 
@@ -2406,18 +2840,23 @@ public class AddressSpaceBuilder {
 package com.opcproxy.opcua;
 
 import com.opcproxy.config.OpcUaConfig;
+import com.opcproxy.config.UaCertificateManager;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.bouncycastle.asn1.x500.X500Name;
 import org.eclipse.milo.opcua.sdk.server.EndpointConfig;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServerConfig;
 import org.eclipse.milo.opcua.sdk.server.identity.AnonymousIdentityValidator;
 import org.eclipse.milo.opcua.sdk.server.identity.CompositeValidator;
 import org.eclipse.milo.opcua.sdk.server.identity.UsernameIdentityValidator;
-import org.eclipse.milo.opcua.stack.core.security.SecurityPolicy;
+import org.eclipse.milo.opcua.stack.core.NodeIds;
+import org.eclipse.milo.opcua.stack.core.security.*;
 import org.eclipse.milo.opcua.stack.core.transport.TransportProfile;
+import org.eclipse.milo.opcua.stack.core.types.builtin.ByteString;
 import org.eclipse.milo.opcua.stack.core.types.builtin.LocalizedText;
+import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
 import org.eclipse.milo.opcua.stack.core.types.enumerated.MessageSecurityMode;
 import org.eclipse.milo.opcua.stack.transport.server.OpcServerTransportFactory;
 import org.eclipse.milo.opcua.stack.transport.server.tcp.OpcTcpServerTransport;
@@ -2428,7 +2867,11 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.net.InetAddress;
+import java.nio.file.Path;
+import java.security.KeyPair;
+import java.security.cert.X509Certificate;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 @Slf4j
@@ -2438,7 +2881,7 @@ public class OpcUaServerManager implements DisposableBean {
 
     private final OpcUaConfig config;
     private final AddressSpaceBuilder addressSpaceBuilder;
-
+    private final UaCertificateManager uaCertificateManager;  // Lombok подхватит
     @Getter
     private volatile OpcUaServer server;
 
@@ -2450,6 +2893,9 @@ public class OpcUaServerManager implements DisposableBean {
         started = true;
         doStart();
     }
+    public String getHostname() {
+        return hostname();
+    }
 
     private void doStart() throws Exception {
         if (server != null) {
@@ -2457,17 +2903,64 @@ public class OpcUaServerManager implements DisposableBean {
             return;
         }
 
-        UsernameIdentityValidator usernameValidator = new UsernameIdentityValidator(
-                authChallenge -> "opcuser".equals(authChallenge.getUsername()) && "opcpassword".equals(authChallenge.getPassword())
-        );
+        // ТЗ §5.5.2: сертификат генерируется при первом запуске (keytool, без BC)
+        uaCertificateManager.ensureCertificate();
+
+        // --- Сертификат сервера: кладём наш keytool-сертификат в store
+        //     ДО инициализации группы (иначе group.initialize() не найдёт его) ---
+        var certificateStore = new MemoryCertificateStore();
+        var entry = new CertificateStore.Entry(
+                uaCertificateManager.getKeyPair().getPrivate(),
+                new X509Certificate[]{ uaCertificateManager.getCertificate() });
+        certificateStore.set(
+               NodeIds.RsaSha256ApplicationCertificateType,
+                entry);
+        var trustListManager = new MemoryTrustListManager();
+
+        // «Доверять всем» (аналог чекбокса arOPC, для стенда). Прод: DefaultClientCertificateValidator + trust-list.
+        var certificateValidator = new CertificateValidator.InsecureCertificateValidator();
+        CertificateFactory certificateFactory =
+                new CertificateFactory() {
+                    @Override public java.security.KeyPair createKeyPair(
+                            NodeId certificateTypeId) {
+                        throw new UnsupportedOperationException(
+                                "Certificate is pre-provisioned via keytool (UaCertificateManager)");
+                    }
+                    @Override public java.security.cert.X509Certificate[] createCertificateChain(
+                            NodeId certificateTypeId,
+                            KeyPair keyPair) {
+                        throw new UnsupportedOperationException(
+                                "Certificate is pre-provisioned via keytool (UaCertificateManager)");
+                    }
+                    @Override public ByteString createSigningRequest(
+                            NodeId certificateTypeId,
+                            KeyPair keyPair,
+                            X500Name subjectName,
+                            String sanUri, List<String> dnsNames, List<String> ipAddresses) {
+                        throw new UnsupportedOperationException(
+                                "CSR not supported for keytool-provisioned certificate");
+                    }
+                };
+        var group = DefaultApplicationGroup.createAndInitialize(
+                trustListManager, certificateStore, certificateFactory, certificateValidator);
+        var certificateManager = new DefaultCertificateManager(
+                new MemoryCertificateQuarantine(), group);
+
+        UsernameIdentityValidator usernameValidator = new UsernameIdentityValidator(   // ДО использования!
+                auth -> "opcuser".equals(auth.getUsername())
+                        && "opcpassword".equals(auth.getPassword()));
 
         OpcUaServerConfig serverConfig = OpcUaServerConfig.builder()
                 .setApplicationName(LocalizedText.english(config.getApplicationName()))
                 .setApplicationUri(config.getApplicationUri())
                 .setProductUri(config.getApplicationUri())
-                .setIdentityValidator(new CompositeValidator(new AnonymousIdentityValidator(), usernameValidator))
-                .setEndpoints(createEndpointConfigs())
+                .setIdentityValidator(new CompositeValidator(
+                        new AnonymousIdentityValidator(), usernameValidator))
+                .setCertificateManager(certificateManager)
+                .setEndpoints(createEndpointConfigs(certificateManager))
                 .build();
+
+
 
         OpcServerTransportFactory transportFactory = transportProfile -> {
             if (transportProfile == TransportProfile.TCP_UASC_UABINARY) {
@@ -2507,22 +3000,40 @@ public class OpcUaServerManager implements DisposableBean {
     public int getBindPort() { return config.getPort(); }
 
     @Override
-    public void destroy() throws Exception {
+    public void destroy() {
         stop();
     }
 
-    private Set<EndpointConfig> createEndpointConfigs() {
+    private Set<EndpointConfig> createEndpointConfigs(CertificateManager certificateManager) {
         Set<EndpointConfig> endpoints = new LinkedHashSet<>();
-        endpoints.add(
-                EndpointConfig.newBuilder()
+
+        // None — всегда
+        endpoints.add(EndpointConfig.newBuilder()
+                .setHostname(hostname())
+                .setBindAddress("0.0.0.0")
+                .setBindPort(config.getPort())
+                .setTransportProfile(TransportProfile.TCP_UASC_UABINARY)
+                .setSecurityPolicy(SecurityPolicy.None)
+                .setSecurityMode(MessageSecurityMode.None)
+                .build());
+
+        // Защищённые — только если сертификат готов (ошибка [143]: был локальный certificateManager)
+        if (uaCertificateManager.getCertificate() != null) {
+            for (String name : config.getEnabledPolicies()) {
+                SecurityPolicy policy = SecurityPolicy.valueOf(name.trim());
+                if (policy == SecurityPolicy.None) continue;
+                endpoints.add(EndpointConfig.newBuilder()
                         .setHostname(hostname())
                         .setBindAddress("0.0.0.0")
                         .setBindPort(config.getPort())
                         .setTransportProfile(TransportProfile.TCP_UASC_UABINARY)
-                        .setSecurityPolicy(SecurityPolicy.None)
-                        .setSecurityMode(MessageSecurityMode.None)
-                        .build()
-        );
+                        .setSecurityPolicy(policy)
+                        .setSecurityMode(MessageSecurityMode.SignAndEncrypt)
+                        .setCertificate(uaCertificateManager.getCertificate())
+                        .build());
+            }
+            log.info("UA secure endpoints enabled: {}", config.getEnabledPolicies());
+        }
         return endpoints;
     }
 
@@ -2553,16 +3064,172 @@ public class SamplingIntervalResolver {
 
     public double resolve(Tag tag) {
         if (tag == null) return defaultSamplingMs;
+        // 1. Приоритет тега
         if (tag.getUaSamplingIntervalMs() != null && tag.getUaSamplingIntervalMs() > 0) {
             return tag.getUaSamplingIntervalMs();
         }
+        // 2. Приоритет профиля
         if (tag.getIntervalProfile() != null
-                && tag.getIntervalProfile().getUaSamplingIntervalMs() != null
-                && tag.getIntervalProfile().getUaSamplingIntervalMs() > 0) {
+                && tag.getIntervalProfile().getUaSamplingIntervalMs() != null) {
             return tag.getIntervalProfile().getUaSamplingIntervalMs();
         }
+        // 3. Глобальный дефолт
         return defaultSamplingMs;
     }
+}
+============================================================
+
+// src/main/java/com/opcproxy/persistence/audit/AuditEvent.java
+package com.opcproxy.persistence.audit;
+
+/**
+ * Событие аудита для асинхронной обработки.
+ * ТЗ §5.10.5: Разрывает циклическую зависимость между Hibernate Interceptor и JPA Repository.
+ */
+public record AuditEvent(
+        Long entityId,
+        String entityType,
+        String action,
+        String oldValue,
+        String newValue
+) {}
+============================================================
+
+package com.opcproxy.persistence.audit;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.hibernate.Interceptor;
+import org.hibernate.type.Type;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Component;
+
+import java.util.Arrays;
+import java.util.stream.Collectors;
+
+/**
+ * Hibernate Interceptor для автоматического аудита изменений сущностей.
+ * ТЗ §5.10.5: перехватывает CREATE/UPDATE/DELETE для сущностей, реализующих Auditable.
+ *
+ * ВАЖНО: Использует ApplicationEventPublisher вместо прямого вызова сервиса,
+ * чтобы избежать циклической зависимости (Circular Dependency) с EntityManagerFactory.
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AuditInterceptor implements Interceptor {
+
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Override
+    public boolean onSave(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
+        if (entity instanceof Auditable) {
+            String entityType = entity.getClass().getSimpleName();
+            eventPublisher.publishEvent(new AuditEvent(
+                    (Long) id, entityType, "CREATE", null, formatState(propertyNames, state)
+            ));
+        }
+        return Interceptor.super.onPersist(entity, id, state, propertyNames, types);
+    }
+
+    @Override
+    public void onDelete(Object entity, Object id, Object[] state, String[] propertyNames, Type[] types) {
+        if (entity instanceof Auditable) {
+            String entityType = entity.getClass().getSimpleName();
+            eventPublisher.publishEvent(new AuditEvent(
+                    (Long) id, entityType, "DELETE", formatState(propertyNames, state), null
+            ));
+        }
+        Interceptor.super.onRemove(entity, id, state, propertyNames, types);
+    }
+
+    @Override
+    public boolean onFlushDirty(Object entity, Object id, Object[] currentState, Object[] previousState, String[] propertyNames, Type[] types) {
+        if (entity instanceof Auditable) {
+            String entityType = entity.getClass().getSimpleName();
+            eventPublisher.publishEvent(new AuditEvent(
+                    (Long) id, entityType, "UPDATE", formatState(propertyNames, previousState), formatState(propertyNames, currentState)
+            ));
+        }
+        return Interceptor.super.onFlushDirty(entity, id, currentState, previousState, propertyNames, types);
+    }
+
+    private String formatState(String[] propertyNames, Object[] state) {
+        if (propertyNames == null || state == null) return null;
+        return Arrays.stream(propertyNames)
+                .limit(state.length)
+                .collect(Collectors.joining(", ", "{", "}"));
+    }
+}
+============================================================
+
+package com.opcproxy.persistence.audit;
+
+import com.opcproxy.persistence.entity.AuditLog;
+import com.opcproxy.persistence.repository.AuditLogRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+
+/**
+ * Сервис записи в audit_log (ТЗ §5.10.5).
+ * Обрабатывает события AuditEvent асинхронно, не блокируя основной поток транзакции.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AuditService {
+
+    private final AuditLogRepository auditLogRepository;
+
+    @Async
+    @EventListener
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void handleAuditEvent(AuditEvent event) {
+        try {
+            AuditLog auditLog = new AuditLog();
+            auditLog.setTimestamp(LocalDateTime.now());
+            auditLog.setActor(getCurrentUsername());
+            auditLog.setAction(event.action());
+            auditLog.setEntityType(event.entityType());
+            auditLog.setEntityId(event.entityId());
+            auditLog.setOldValue(event.oldValue());
+            auditLog.setNewValue(event.newValue());
+
+            auditLogRepository.save(auditLog);
+            log.debug("Audit saved: {} {} id={}", event.action(), event.entityType(), event.entityId());
+        } catch (Exception e) {
+            log.error("Failed to write audit log for {} {}: {}", event.action(), event.entityType(), e.getMessage());
+        }
+    }
+
+    private String getCurrentUsername() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.getName() != null && !"anonymousUser".equals(auth.getName())) {
+            return auth.getName();
+        }
+        return "system";
+    }
+}
+============================================================
+
+// src/main/java/com/opcproxy/persistence/audit/Auditable.java
+package com.opcproxy.persistence.audit;
+
+/**
+ * Маркерный интерфейс для сущностей, изменения которых должны логироваться в audit_log.
+ * ТЗ §5.10.5: "Все изменения конфигурации должны журналироваться".
+ */
+public interface Auditable {
+    Long getId();
 }
 ============================================================
 
@@ -2615,6 +3282,7 @@ public class AuditLog {
 
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -2630,7 +3298,7 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "interval_profile",
         uniqueConstraints = @UniqueConstraint(name = "uq_interval_profile_name", columnNames = "name"))
-public class IntervalProfile {
+public class IntervalProfile implements Auditable {
 
     @Id
     @EqualsAndHashCode.Include
@@ -2671,6 +3339,7 @@ public class IntervalProfile {
 
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.ReadMode;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -2685,7 +3354,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "opc_da_connection")
-public class OpcDaConnection {
+public class OpcDaConnection implements Auditable {
 
     @Id
     @EqualsAndHashCode.Include
@@ -2746,6 +3415,7 @@ public class OpcDaConnection {
 
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -2758,7 +3428,7 @@ import java.time.LocalDateTime;
 @Data
 @Entity
 @Table(name = "system_setting")
-public class SystemSetting {
+public class SystemSetting implements Auditable {
     @Id
     private String key;
     @Column(nullable = false, columnDefinition = "TEXT")
@@ -2769,6 +3439,10 @@ public class SystemSetting {
     protected void onUpdate() {
         updatedAt = LocalDateTime.now();
     }
+    @Override
+    public Long getId() {
+        return key != null ? (long) key.hashCode() : null;
+    }
 }
 
 
@@ -2776,6 +3450,7 @@ public class SystemSetting {
 
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.DataType;
 import com.opcproxy.persistence.enums.ReadMode;
 import com.opcproxy.persistence.enums.SourceType;
@@ -2793,7 +3468,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "tag")
-public class Tag {
+public class Tag implements Auditable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -2863,6 +3538,7 @@ public class Tag {
 
 package com.opcproxy.persistence.entity;
 
+import com.opcproxy.persistence.audit.Auditable;
 import com.opcproxy.persistence.enums.UserRole;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -2878,7 +3554,7 @@ import java.time.LocalDateTime;
 @EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @Entity
 @Table(name = "user_account")
-public class UserAccount {
+public class UserAccount implements Auditable {
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     @EqualsAndHashCode.Include
     private Long id;
@@ -3102,19 +3778,23 @@ public class CsvApiController {
 package com.opcproxy.rest;
 
 import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaConnectionManager;
+import com.opcproxy.opcua.OpcUaServerManager;
 import com.opcproxy.persistence.entity.IntervalProfile;
+import com.opcproxy.rest.dto.RestDtos;
 import com.opcproxy.rest.dto.RestDtos.ConnectionCreateRequest;
 import com.opcproxy.rest.dto.RestDtos.ConnectionDto;
 import com.opcproxy.rest.dto.RestDtos.StatusDto;
 import com.opcproxy.rest.dto.RestDtos.TagDto;
 import com.opcproxy.persistence.entity.OpcDaConnection;
-import com.opcproxy.persistence.entity.Tag;                       // <-- entity импортом
+import com.opcproxy.persistence.entity.Tag;
 import com.opcproxy.tags.TagRegistry;
 import com.opcproxy.ui.services.ConnectionService;
 import com.opcproxy.ui.services.IntervalProfileService;
 import com.opcproxy.ui.services.TagService;
 import io.swagger.v3.oas.annotations.Operation;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -3122,7 +3802,7 @@ import org.springframework.web.bind.annotation.*;
 import java.net.URI;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-
+@Slf4j
 @io.swagger.v3.oas.annotations.tags.Tag(                          // <-- FQ-имя аннотации
         name = "Gateway API",
         description = "Управление подключениями и тегами шлюза (ТЗ §5.9)")
@@ -3137,7 +3817,8 @@ public class GatewayApiController {
     private final IntervalProfileService profileService;
     private final TagService tagService;
     private final TagRegistry tagRegistry;
-
+    private final OpcUaServerManager opcUaServerManager;
+    private final OpcDaConnectionManager connectionManager;
     // ---------------- Status ----------------
 
     @Operation(summary = "Сводный статус шлюза")
@@ -3153,8 +3834,25 @@ public class GatewayApiController {
                         .map(v -> v.getQuality() != null && v.getQuality().startsWith("Good"))
                         .orElse(false))
                 .count();
-        return new StatusDto(conns.size(), (int) connected, tags.size(), (int) good,
-                "opc.tcp://Home-PC:4840");   // TODO: из конфига
+        String uaEndpoint = opcUaServerManager.isRunning()
+                ? "opc.tcp://" + opcUaServerManager.getHostname() + ":" + opcUaServerManager.getBindPort()
+                : null;
+        return new StatusDto(conns.size(), (int) connected,
+                tags.size(), (int) good, uaEndpoint);
+    }
+    @Operation(summary = "Браузинг тегов OPC DA (плоский список с кэшированием 60с, ТЗ §5.2.6, §5.9.3)")
+    @GetMapping("/connections/{id}/browse")
+    public ResponseEntity<List<RestDtos.BrowseNodeDto>> browse(@PathVariable Long id) {
+        try {
+            List<RestDtos.BrowseNodeDto> result = connectionManager.browse(id);
+            return ResponseEntity.ok(result);
+        } catch (IllegalStateException e) {
+            log.warn("Browse failed (not connected) for connection {}: {}", id, e.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        } catch (Exception e) {
+            log.error("Browse failed for connection {}: {}", id, e.getMessage());
+            throw new IllegalStateException("Ошибка браузинга OPC DA: " + e.getMessage());
+        }
     }
 
     // ---------------- Connections ----------------
@@ -3255,9 +3953,12 @@ public class GatewayApiController {
         return tagService.findById(id).map(this::toDto)
                 .orElseThrow(() -> new java.util.NoSuchElementException("Tag not found: " + id));
     }
+
     @Operation(summary = "Профили интервалов OPC UA")
-    @GetMapping("/api/v1/interval-profiles")
-    public List<IntervalProfile> profiles() { return profileService.findAll(); }
+    @GetMapping("/interval-profiles")          // итоговый URL: /api/v1/interval-profiles ✅
+    public List<IntervalProfile> profiles() {
+        return profileService.findAll();
+    }
     // ---------------- Helpers ----------------
 
     private void applyToEntity(OpcDaConnection c, ConnectionCreateRequest req) {
@@ -3334,6 +4035,8 @@ import com.opcproxy.opcda.ConnectionState;
 import com.opcproxy.persistence.entity.OpcDaConnection;
 import com.opcproxy.persistence.entity.Tag;
 
+import java.util.List;
+
 public final class RestDtos {
 
     private RestDtos() {}
@@ -3368,6 +4071,14 @@ public final class RestDtos {
                             int tagsTotal, int tagsGood, String opcUaEndpoint) {}
 
     public record ImportResultDto(int total, int created, int updated, int errors) {}
+    public record BrowseNodeDto(
+            String name,
+            String itemId,
+            boolean isBranch,
+            List<BrowseNodeDto> children
+    ) {
+
+    }
 }
 ============================================================
 
@@ -3682,6 +4393,7 @@ public class ConnectionService {
     private final OpcDaConnectionManager connectionManager;
     private final PasswordCipher passwordCipher;   // <-- ДОБАВИТЬ (или import)
     private final TagRegistry tagRegistry;
+    private final TagService tagService;
 
     public List<OpcDaConnection> findAll() {
         return connectionRepository.findAll();
@@ -3736,11 +4448,16 @@ public class ConnectionService {
         connectionRepository.findById(id).ifPresent(conn -> {
             conn.setEnabled(enabled);
             connectionRepository.save(conn);
+            // П.1.2/п.2: теги сервера следуют за сервером; при выключении
+            // каждый получает Bad_ServerDisabled (в т.ч. в OPC UA)
+            tagService.setEnabledByConnection(id, enabled);
+            connectionManager.disconnect(id);
             if (enabled) {
-                connectionManager.disconnect(id);
-                connectionManager.tryConnect(conn);
-            } else {
-                connectionManager.disconnect(id);
+                if (connectionManager.tryConnect(conn)) {
+                    log.info("Connection '{}' (re)connected after enable", conn.getName());
+                } else {
+                    log.warn("Connection '{}' enabled but not connected — background retry", conn.getName());
+                }
             }
         });
     }
@@ -3996,6 +4713,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -4035,15 +4753,52 @@ public class TagService {
     }
     @Transactional
     public void setEnabled(Long id, boolean enabled) {
-        tagRepository.findById(id).ifPresent(tag -> {
-            tag.setEnabled(enabled);
-            tagRepository.save(tag);
-            if (enabled) {
+        tagRepository.findById(id).ifPresent(tag -> applyEnabled(tag, enabled));
+    }
+    /** П.1.2: все теги сервера следуют за сервером. @return число изменённых. */
+    @Transactional
+    public int setEnabledByConnection(Long connectionId, boolean enabled) {
+        int changed = 0;
+        for (Tag t : tagRepository.findByConnectionId(connectionId)) {
+            if (applyEnabled(t, enabled)) changed++;
+        }
+        return changed;
+    }
+
+    /** П.1.4: bulk для набора id (отображаемые в detail теги). */
+    @Transactional
+    public int setEnabledMany(Collection<Long> ids, boolean enabled) {
+        int changed = 0;
+        for (Long id : ids) {
+            Tag t = tagRepository.findById(id).orElse(null);
+            if (t != null && applyEnabled(t, enabled)) changed++;
+        }
+        return changed;
+    }
+    /**
+     * П.2: выключенный тег ОБЯЗАН быть Bad в реестре — тогда событие дойдёт
+     * до AddressSpaceBuilder, и OPC UA-клиент увидит Bad вместо «застывшего»
+     * последнего значения. Включённый — регистрируется заново.
+     * @return true, если флаг изменился.
+     */
+    private boolean applyEnabled(Tag tag, boolean enabled) {
+        boolean cur = Boolean.TRUE.equals(tag.getEnabled());
+        if (cur == enabled) {
+            if (!enabled) {   // идемпотентная страховка Bad-статуса
                 tagRegistry.registerTag(tag);
-            } else {
-                tagRegistry.unregisterTag(id);
+                tagRegistry.updateTagValue(tag.getId(), null, "Bad_Disabled", java.time.Instant.now());
             }
-        });
+            return false;
+        }
+        tag.setEnabled(enabled);
+        tagRepository.save(tag);
+        if (enabled) {
+            tagRegistry.registerTag(tag);
+        } else {
+            tagRegistry.registerTag(tag);   // гарантируем наличие записи в реестре
+            tagRegistry.updateTagValue(tag.getId(), null, "Bad_Disabled", java.time.Instant.now());
+        }
+        return true;
     }
 }
 ============================================================
@@ -4803,6 +5558,7 @@ import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.checkbox.Checkbox;
 import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.grid.contextmenu.GridContextMenu;
 import com.vaadin.flow.component.html.H2;
 import com.vaadin.flow.component.html.Span;
 import com.vaadin.flow.component.icon.Icon;
@@ -4862,6 +5618,10 @@ public class MasterDetailView extends VerticalLayout {
     private final TextField tagFilter = new TextField("Tag filter");
     private final Checkbox onlyActiveServers = new Checkbox("Active servers only");
     private final Checkbox onlyGoodTags = new Checkbox("Good tags only");
+    private final Button disableAllServers = new Button("Disable All Servers");
+    private final Button enableAllServers = new Button("Enable All Servers");
+    private final Button detailDisableAll = new Button("Disable All");
+    private final Button detailEnableAll = new Button("Enable All");
 
     private OpcDaConnection selectedServer;      // null = показать все теги
     private ListDataProvider<Tag> detailProvider;
@@ -4896,6 +5656,7 @@ public class MasterDetailView extends VerticalLayout {
         setSizeFull();
 
         add(createHeader(), createFilters(), createSplit());
+        createMasterContextMenu();
         refreshMaster();
     }
 
@@ -4910,10 +5671,17 @@ public class MasterDetailView extends VerticalLayout {
         Button addTag = new Button("Add Tag", new Icon(VaadinIcon.PLUS));
         addTag.addClickListener(e -> tagDialog.edit(null));
 
-        HorizontalLayout h = new HorizontalLayout(title, addServer, addTag);
+        HorizontalLayout h = new HorizontalLayout(title, addServer, addTag,
+                enableAllServers, disableAllServers);
         h.setWidthFull();
         h.setAlignItems(FlexComponent.Alignment.CENTER);
         h.expand(title);
+
+        disableAllServers.addThemeVariants(ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_SMALL);
+        disableAllServers.addClickListener(e -> setAllServers(false));
+        enableAllServers.addThemeVariants(ButtonVariant.LUMO_SUCCESS, ButtonVariant.LUMO_SMALL);
+        enableAllServers.addClickListener(e -> setAllServers(true));
+
         return h;
     }
 
@@ -4953,16 +5721,66 @@ public class MasterDetailView extends VerticalLayout {
         masterPanel.setSizeFull();
         masterPanel.setPadding(false);
 
-        VerticalLayout detailPanel = new VerticalLayout(new H2("Tags"), detailGrid);
+        HorizontalLayout detailToolbar = new HorizontalLayout(new H2("Tags"), detailDisableAll, detailEnableAll);
+        detailToolbar.setWidthFull();
+        detailToolbar.setAlignItems(FlexComponent.Alignment.CENTER);
+
+        VerticalLayout detailPanel = new VerticalLayout(detailToolbar, detailGrid);
         detailPanel.setSizeFull();
         detailPanel.setPadding(false);
+
+        detailDisableAll.addThemeVariants(ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_SMALL);
+        detailDisableAll.addClickListener(e -> setAllVisibleTags(false));
+        detailEnableAll.addThemeVariants(ButtonVariant.LUMO_SUCCESS, ButtonVariant.LUMO_SMALL);
+        detailEnableAll.addClickListener(e -> setAllVisibleTags(true));
 
         SplitLayout split = new SplitLayout(masterPanel, detailPanel);
         split.setSizeFull();
         split.setSplitterPosition(45);
         return split;
     }
+    private void setAllServers(boolean enabled) {
+        int n = 0;
+        for (OpcDaConnection c : connectionService.findAll()) {
+            if (Boolean.TRUE.equals(c.getEnabled()) != enabled) n++;
+            connectionService.setEnabled(c.getId(), enabled);   // каскад на теги внутри
+        }
+        Notification.show((enabled ? "Enabled" : "Disabled") + " servers: " + n,
+                2000, Notification.Position.BOTTOM_END);
+        refreshMaster();
+        refreshDetail();
+    }
+    private void createMasterContextMenu() {
+        GridContextMenu<OpcDaConnection> menu = masterGrid.addContextMenu();
 
+        menu.addItem("Edit", e -> e.getItem().ifPresent(c ->
+                connectionsDialog.edit(connectionService.findById(c.getId()).orElse(null))));
+
+        menu.addItem("Enable server", e -> e.getItem()
+                .ifPresent(c -> { connectionService.setEnabled(c.getId(), true); refreshMaster(); refreshDetail(); }));
+        menu.addItem("Disable server", e -> e.getItem()
+                .ifPresent(c -> { connectionService.setEnabled(c.getId(), false); refreshMaster(); refreshDetail(); }));
+
+        menu.addItem("Enable all tags of server", e -> e.getItem().ifPresent(c -> {
+            int n = tagService.setEnabledByConnection(c.getId(), true);
+            Notification.show("Enabled tags: " + n, 2000, Notification.Position.BOTTOM_END);
+            refreshDetail(); refreshMaster();
+        }));
+        menu.addItem("Disable all tags of server", e -> e.getItem().ifPresent(c -> {
+            int n = tagService.setEnabledByConnection(c.getId(), false);
+            Notification.show("Disabled tags: " + n, 2000, Notification.Position.BOTTOM_END);
+            refreshDetail(); refreshMaster();
+        }));
+    }
+    private void setAllVisibleTags(boolean enabled) {
+        List<Long> ids = visibleTags().stream().map(Tag::getId).toList();
+        if (ids.isEmpty()) return;
+        int n = tagService.setEnabledMany(ids, enabled);
+        Notification.show((enabled ? "Enabled" : "Disabled") + " tags: " + n,
+                2000, Notification.Position.BOTTOM_END);
+        refreshDetail();
+        refreshMaster();
+    }
     private void buildMasterGrid() {
         masterGrid.setSizeFull();
         masterGrid.setSelectionMode(Grid.SelectionMode.SINGLE);
@@ -4978,6 +5796,7 @@ public class MasterDetailView extends VerticalLayout {
         masterGrid.addComponentColumn(this::serverActions)
                 .setHeader("Actions").setFlexGrow(0).setWidth("170px");
 
+
         // Part-имя строки вынесено в отдельный метод с явным типом
         masterGrid.setPartNameGenerator(this::masterRowClass);
 
@@ -4986,6 +5805,8 @@ public class MasterDetailView extends VerticalLayout {
                 e.getFirstSelectedItem().ifPresentOrElse(
                         this::selectServer,
                         this::clearServerSelection));
+        masterProvider = new ListDataProvider<>(new java.util.ArrayList<>());
+        masterGrid.setDataProvider(masterProvider);
     }
 
     /**
@@ -5069,7 +5890,6 @@ public class MasterDetailView extends VerticalLayout {
 
     private void refreshMaster() {
         List<OpcDaConnection> all = connectionService.findAll();
-
         boolean onlyActive = onlyActiveServers.getValue();
         String f = serverFilter.getValue() == null ? "" : serverFilter.getValue().toLowerCase();
 
@@ -5079,35 +5899,37 @@ public class MasterDetailView extends VerticalLayout {
                         || contains(c.getName(), f)
                         || contains(c.getHost(), f)
                         || contains(c.getProgIdOrClsid(), f))
-                .collect(Collectors.toList());
+                .toList();
 
-        masterProvider = new ListDataProvider<>(filtered);
-        masterGrid.setDataProvider(masterProvider);
+        // П.1.1 КЛЮЧ: мутируем коллекцию провайдера, а не подменяем провайдер —
+        // setDataProvider() сбрасывает выделение, refreshAll() — сохраняет.
+        masterProvider.getItems().clear();
+        masterProvider.getItems().addAll(filtered);
+        masterProvider.refreshAll();
 
-        // если выделенный сервер пропал из фильтра — сброс
         if (selectedServer != null && filtered.stream()
                 .noneMatch(c -> c.getId().equals(selectedServer.getId()))) {
-            masterGrid.deselectAll(); // вызовет clearServerSelection
+            masterGrid.deselectAll();
         }
+    }
+    private List<Tag> visibleTags() {
+        String f = tagFilter.getValue() == null ? "" : tagFilter.getValue().toLowerCase();
+        boolean onlyGood = onlyGoodTags.getValue();
+        return currentTags().stream()
+                .filter(t -> f.isEmpty()
+                        || contains(t.getName(), f)
+                        || contains(t.getSourceItemId(), f))
+                .filter(t -> !onlyGood || qualityOf(t).startsWith("Good")).toList();
     }
 
     private void refreshDetail() {
         tagValueSpans.clear();
-        lastQualitySignature = 0;   // форс-пересчёт подписки quality на следующем poll-е
-
-        String f = tagFilter.getValue() == null ? "" : tagFilter.getValue().toLowerCase();
-        boolean onlyGood = onlyGoodTags.getValue();
-
-        List<Tag> filtered = currentTags().stream()
-                .filter(t -> f.isEmpty()
-                        || contains(t.getName(), f)
-                        || contains(t.getSourceItemId(), f))
-                .filter(t -> !onlyGood || qualityOf(t).startsWith("Good"))
-                .collect(Collectors.toList());
-
-        detailProvider = new ListDataProvider<>(filtered);
+        lastQualitySignature = 0;
+        detailProvider = new ListDataProvider<>(visibleTags());
         detailGrid.setDataProvider(detailProvider);
     }
+
+
 
     private static boolean contains(String s, String lower) {
         return s != null && s.toLowerCase().contains(lower);
@@ -7486,5 +8308,304 @@ public class Server
             this.server.removeGroup ( group.getServerHandle (), force );
             this.groups.remove ( group.getServerHandle () );
         }
+    }
+}
+============================================================
+
+package rpc.security.ntlm;
+
+import java.io.UnsupportedEncodingException;
+import java.security.DigestException;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
+import java.util.Random;
+
+import org.bouncycastle.crypto.StreamCipher;
+import org.bouncycastle.crypto.digests.MD4Digest;
+import org.bouncycastle.crypto.digests.MD5Digest;
+import org.bouncycastle.crypto.engines.RC4Engine;
+import org.bouncycastle.crypto.params.KeyParameter;
+
+/**
+ * NTLMKeyFactory — фабрика ключей для протокола NTLM.
+ * Переписанный класс из проекта Jarapac (http://jarapac.sourceforge.net/).
+ * Оригинальный код распространялся под лицензией GNU LGPL.
+ */
+public class NTLMKeyFactory {
+
+    private final Random random = new Random();
+
+    // Магические константы для генерации ключей подписи и шифрования
+    private static final byte[] clientSigningMagicConstant = new byte[] {
+            0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6b, 0x65,
+            0x79, 0x20, 0x74, 0x6f, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e,
+            0x74, 0x2d, 0x74, 0x6f, 0x2d, 0x73, 0x65, 0x72, 0x76, 0x65,
+            0x72, 0x20, 0x73, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x20,
+            0x6b, 0x65, 0x79, 0x20, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x20,
+            0x63, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x00
+    }; // "session key to client-to-server signing key magic constant"
+
+    private static final byte[] serverSigningMagicConstant = new byte[] {
+            0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6b, 0x65,
+            0x79, 0x20, 0x74, 0x6f, 0x20, 0x73, 0x65, 0x72, 0x76, 0x65,
+            0x72, 0x2d, 0x74, 0x6f, 0x2d, 0x63, 0x6c, 0x69, 0x65, 0x6e,
+            0x74, 0x20, 0x73, 0x69, 0x67, 0x6e, 0x69, 0x6e, 0x67, 0x20,
+            0x6b, 0x65, 0x79, 0x20, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x20,
+            0x63, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x00
+    }; // "session key to server-to-client signing key magic constant"
+
+    private static final byte[] clientSealingMagicConstant = new byte[] {
+            0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6b, 0x65,
+            0x79, 0x20, 0x74, 0x6f, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e,
+            0x74, 0x2d, 0x74, 0x6f, 0x2d, 0x73, 0x65, 0x72, 0x76, 0x65,
+            0x72, 0x20, 0x73, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67, 0x20,
+            0x6b, 0x65, 0x79, 0x20, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x20,
+            0x63, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x00
+    }; // "session key to client-to-server sealing key magic constant"
+
+    private static final byte[] serverSealingMagicConstant = new byte[] {
+            0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6b, 0x65,
+            0x79, 0x20, 0x74, 0x6f, 0x20, 0x73, 0x65, 0x72, 0x76, 0x65,
+            0x72, 0x2d, 0x74, 0x6f, 0x2d, 0x63, 0x6c, 0x69, 0x65, 0x6e,
+            0x74, 0x20, 0x73, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67, 0x20,
+            0x6b, 0x65, 0x79, 0x20, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x20,
+            0x63, 0x6f, 0x6e, 0x73, 0x74, 0x61, 0x6e, 0x74, 0x00
+    }; // "session key to server-to-client sealing key magic constant"
+
+    NTLMKeyFactory() {
+        // Пустой конструктор по умолчанию
+    }
+
+    /**
+     * NTLMv1 User Session Key. Случаи, когда LMcompatibilitylevel = 0,1,2.
+     * Для 3,4,5 логика отличается и зависит от типа ответа (LMv2 или NTLMv2).
+     */
+    byte[] getNTLMUserSessionKey(final String password)
+            throws UnsupportedEncodingException, DigestException {
+        final byte[] ntlmHash = Responses.ntlmHash(password);
+        return digestMD4(ntlmHash);
+    }
+
+    /**
+     * NTLMv2 User Session Key.
+     */
+    byte[] getNTLMv2UserSessionKey(final String target, final String user,
+                                   final String password, final byte[] challenge,
+                                   final byte[] blob) throws Exception {
+        final byte[] ntlm2Hash = Responses.ntlmv2Hash(target, user, password);
+        final byte[] data = new byte[challenge.length + blob.length];
+        System.arraycopy(challenge, 0, data, 0, challenge.length);
+        System.arraycopy(blob, 0, data, challenge.length, blob.length);
+        final byte[] mac = Responses.hmacMD5(data, ntlm2Hash);
+        return Responses.hmacMD5(mac, ntlm2Hash);
+    }
+
+    /**
+     * NTLM2 Session Response User Session Key.
+     *
+     * @param password    пароль пользователя
+     * @param servernonce challenge + nonce из NTLM2 Session Response
+     */
+    byte[] getNTLM2SessionResponseUserSessionKey(final String password,
+                                                 final byte[] servernonce)
+            throws NoSuchAlgorithmException, UnsupportedEncodingException,
+            DigestException {
+        return Responses.hmacMD5(servernonce, getNTLMUserSessionKey(password));
+    }
+
+    /**
+     * Случайно сгенерированный 16-байтовый вторичный сессионный ключ.
+     */
+    byte[] getSecondarySessionKey() {
+        final byte[] key = new byte[16];
+        this.random.nextBytes(key);
+        return key;
+    }
+
+    /**
+     * Создаёт и инициализирует RC4-шифр с заданным ключом.
+     */
+    StreamCipher getRC4(final byte[] key) {
+        final RC4Engine rc4 = new RC4Engine();
+        rc4.init(true, new KeyParameter(key));
+        return rc4;
+    }
+
+    /**
+     * Применяет RC4-шифр к данным (шифрование/дешифрование).
+     * * Исправленный метод для работы с BC 1.78.1
+     */
+
+    byte[] applyRC4(final StreamCipher streamCipher, final byte[] data) {
+        final byte[] retData = new byte[data.length];
+
+        // В BC 1.78.1 processBytes возвращает int.
+        // Мы вызываем его и игнорируем результат, чтобы не было ошибки.
+        streamCipher.processBytes(data, 0, data.length, retData, 0);
+
+        return retData;
+    }
+
+    private void safeProcessBytes(StreamCipher cipher, byte[] in, int inOff, int len, byte[] out, int outOff) {
+        try {
+            // Пробуем вызвать метод через рефлексию, если сигнатуры различаются
+            cipher.processBytes(in, inOff, len, out, outOff);
+        } catch (NoSuchMethodError e) {
+            // Это сработает, если сигнатура ожидает возвращаемое значение,
+            // но мы его игнорируем
+        }
+    }
+
+    /**
+     * Дешифрование вторичного сессионного ключа с помощью RC4.
+     */
+    byte[] decryptSecondarySessionKey(final byte[] encryptedData, final byte[] key)
+            throws IllegalStateException {
+        return applyRC4(getRC4(key), encryptedData);
+    }
+
+    /**
+     * Шифрование вторичного сессионного ключа с помощью RC4.
+     */
+    byte[] encryptSecondarySessionKey(final byte[] plainData, final byte[] key)
+            throws IllegalStateException {
+        return applyRC4(getRC4(key), plainData);
+    }
+
+    /**
+     * Генерация клиентского ключа подписи на основе согласованного вторичного сессионного ключа.
+     */
+    byte[] generateClientSigningKeyUsingNegotiatedSecondarySessionKey(
+            final byte[] secondarySessionKey) {
+        final byte[] dataforhash = new byte[secondarySessionKey.length
+                + clientSigningMagicConstant.length];
+        System.arraycopy(secondarySessionKey, 0, dataforhash, 0,
+                secondarySessionKey.length);
+        System.arraycopy(clientSigningMagicConstant, 0, dataforhash,
+                secondarySessionKey.length, clientSigningMagicConstant.length);
+        return digestMD5(dataforhash);
+    }
+
+    /**
+     * Генерация клиентского ключа шифрования (sealing) на основе согласованного
+     * вторичного сессионного ключа.
+     */
+    byte[] generateClientSealingKeyUsingNegotiatedSecondarySessionKey(
+            final byte[] secondarySessionKey) {
+        final byte[] dataforhash = new byte[secondarySessionKey.length
+                + clientSealingMagicConstant.length];
+        System.arraycopy(secondarySessionKey, 0, dataforhash, 0,
+                secondarySessionKey.length);
+        System.arraycopy(clientSealingMagicConstant, 0, dataforhash,
+                secondarySessionKey.length, clientSealingMagicConstant.length);
+        return digestMD5(dataforhash);
+    }
+
+    /**
+     * Генерация серверного ключа подписи на основе согласованного вторичного сессионного ключа.
+     */
+    byte[] generateServerSigningKeyUsingNegotiatedSecondarySessionKey(
+            final byte[] secondarySessionKey) {
+        final byte[] dataforhash = new byte[secondarySessionKey.length
+                + serverSigningMagicConstant.length];
+        System.arraycopy(secondarySessionKey, 0, dataforhash, 0,
+                secondarySessionKey.length);
+        System.arraycopy(serverSigningMagicConstant, 0, dataforhash,
+                secondarySessionKey.length, serverSigningMagicConstant.length);
+        return digestMD5(dataforhash);
+    }
+
+    /**
+     * Вычисляет MD5-дайджест.
+     */
+    public static byte[] digestMD5(final byte[] dataforhash) {
+        final MD5Digest md5 = new MD5Digest();
+        md5.update(dataforhash, 0, dataforhash.length);
+        final byte[] digest = new byte[md5.getDigestSize()];
+        md5.doFinal(digest, 0);
+        return digest;
+    }
+
+    /**
+     * Вычисляет MD4-дайджест.
+     */
+    public static byte[] digestMD4(final byte[] dataforhash) {
+        final MD4Digest md4 = new MD4Digest();
+        md4.update(dataforhash, 0, dataforhash.length);
+        final byte[] digest = new byte[md4.getDigestSize()];
+        md4.doFinal(digest, 0);
+        return digest;
+    }
+
+    /**
+     * Генерация серверного ключа шифрования (sealing) на основе согласованного
+     * вторичного сессионного ключа.
+     */
+    byte[] generateServerSealingKeyUsingNegotiatedSecondarySessionKey(
+            final byte[] secondarySessionKey) {
+        final byte[] dataforhash = new byte[secondarySessionKey.length
+                + serverSealingMagicConstant.length];
+        System.arraycopy(secondarySessionKey, 0, dataforhash, 0,
+                secondarySessionKey.length);
+        System.arraycopy(serverSealingMagicConstant, 0, dataforhash,
+                secondarySessionKey.length, serverSealingMagicConstant.length);
+        return digestMD5(dataforhash);
+    }
+
+    /**
+     * Первая часть формирования подписи: вычисление HMAC-MD5 и сборка
+     * 16-байтового верификатора.
+     */
+    byte[] signingPt1(final int sequenceNumber, final byte[] signingKey,
+                      final byte[] data, final int lengthOfBuffer)
+            throws NoSuchAlgorithmException, IllegalStateException {
+        final byte[] seqNumPlusData = new byte[4 + lengthOfBuffer];
+
+        seqNumPlusData[0] = (byte) (sequenceNumber & 0xFF);
+        seqNumPlusData[1] = (byte) ((sequenceNumber >> 8) & 0xFF);
+        seqNumPlusData[2] = (byte) ((sequenceNumber >> 16) & 0xFF);
+        seqNumPlusData[3] = (byte) ((sequenceNumber >> 24) & 0xFF);
+
+        System.arraycopy(data, 0, seqNumPlusData, 4, lengthOfBuffer);
+
+        final byte[] retval = new byte[16];
+        retval[0] = 0x01; // Версия 1 (LE)
+
+        final byte[] sign = Responses.hmacMD5(seqNumPlusData, signingKey);
+
+        for (int i = 0; i < 8; i++) {
+            retval[i + 4] = sign[i];
+        }
+
+        retval[12] = (byte) (sequenceNumber & 0xFF);
+        retval[13] = (byte) ((sequenceNumber >> 8) & 0xFF);
+        retval[14] = (byte) ((sequenceNumber >> 16) & 0xFF);
+        retval[15] = (byte) ((sequenceNumber >> 24) & 0xFF);
+
+        return retval;
+    }
+
+    /**
+     * Вторая часть формирования подписи: наложение RC4-шифра на первые
+     * 8 байт верификатора.
+     * Исправленный метод для работы с BC 1.78.1
+     */
+    /**
+
+     */
+    void signingPt2(final byte[] verifier, final StreamCipher rc4)
+            throws IllegalStateException {
+        for (int i = 0; i < 8; i++) {
+            // В современных BC StreamCipher имеет метод returnByte,
+            // который возвращает byte. Убедитесь, что он используется.
+            verifier[i + 4] = rc4.returnByte(verifier[i + 4]);
+        }
+    }
+
+    /**
+     * Сравнивает две подписи.
+     */
+    boolean compareSignature(final byte[] src, final byte[] target) {
+        return Arrays.equals(src, target);
     }
 }

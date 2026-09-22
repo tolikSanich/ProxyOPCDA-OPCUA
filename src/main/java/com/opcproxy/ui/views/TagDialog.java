@@ -292,7 +292,7 @@ public class TagDialog extends Dialog {
     public void edit(Tag tag) {
         if (tag == null) {
             currentTag = new Tag();
-            currentTag.setSourceType(SourceType.DA);   // дефолт — DA
+            currentTag.setSourceType(SourceType.DA);
             currentTag.setReadMode(ReadMode.ASYNC);
             currentTag.setRefreshPeriodMs(1000);
             currentTag.setEnabled(true);
@@ -300,13 +300,9 @@ public class TagDialog extends Dialog {
         } else {
             currentTag = tag;
         }
-
         binder.setBean(currentTag);
-        // Видимость выставляем ЯВНО по фактическому типу (надёжнее, чем ждать listener:
-        // при setBean listener сработает, но порядок/повторы не гарантированы)
         updateFieldVisibility(currentTag.getSourceType());
-
-        setHeaderTitle(tag == null ? "Add Tag" : "Edit Tag");
+        setHeaderTitle(tag == null || tag.getId() == null ? "Add Tag" : "Edit Tag");
         mqttDeadbandField.setVisible(Boolean.TRUE.equals(currentTag.getPublishMqtt()));
         open();
     }

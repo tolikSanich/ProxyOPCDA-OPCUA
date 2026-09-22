@@ -10,11 +10,13 @@ java/
         ExpressionNormalizer.java
         SpelCalcEngine.java
       config/
+        HibernateConfig.java
         JInteropConfig.java
         JasyptConfig.java
         OpcDaConfig.java
         OpcUaConfig.java
         SecurityConfig.java
+        UaCertificateManager.java
       csv/
         CsvTagService.java
       mqtt/
@@ -31,6 +33,11 @@ java/
         OpcUaServerManager.java
         SamplingIntervalResolver.java
       persistence/
+        audit/
+          AuditEvent.java
+          AuditInterceptor.java
+          AuditService.java
+          Auditable.java
         entity/
           AuditLog.java
           IntervalProfile.java
@@ -88,3 +95,7 @@ java/
         lib/
           da/
             Server.java
+  rpc/
+    security/
+      ntlm/
+        NTLMKeyFactory.java

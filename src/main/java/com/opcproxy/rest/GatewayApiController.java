@@ -1,6 +1,7 @@
 package com.opcproxy.rest;
 
 import com.opcproxy.opcda.ConnectionState;
+import com.opcproxy.opcda.OpcDaClient;
 import com.opcproxy.opcda.OpcDaConnectionManager;
 import com.opcproxy.opcua.OpcUaServerManager;
 import com.opcproxy.persistence.entity.IntervalProfile;
@@ -25,6 +26,8 @@ import org.springframework.web.bind.annotation.*;
 import java.net.URI;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Optional;
+
 @Slf4j
 @io.swagger.v3.oas.annotations.tags.Tag(                          // <-- FQ-имя аннотации
         name = "Gateway API",
@@ -89,6 +92,7 @@ public class GatewayApiController {
                         connectionService.getErrorCount(c.getId())))
                 .toList();
     }
+
 
     @Operation(summary = "Подключение по id")
     @GetMapping("/connections/{id}")

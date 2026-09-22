@@ -43,9 +43,8 @@ public class MainLayout extends AppLayout implements RouterLayout {
         // В методе createDrawer() добавьте:
         nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
         // В следующих этапах добавим сюда остальные вьюшки:
-        // nav.addItem(new SideNavItem("Connections", ConnectionsView.class));
-        // nav.addItem(new SideNavItem("Tags", TagsView.class));
         // Внутри метода createDrawer() класса MainLayout.java
+        nav.addItem(new SideNavItem("Browse", BrowseView.class)); // <-- ДОБАВИТЬ
         nav.addItem(new SideNavItem("Tags", TagsView.class));
         nav.addItem(new SideNavItem("Servers & Tags", MasterDetailView.class));
         nav.addItem(new SideNavItem("Import/Export", ImportExportView.class));
